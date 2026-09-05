@@ -1,0 +1,28 @@
+# 虚拟环境
+.venv/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 运行产生的本地数据（含按你的选择保存的 SMTP 授权码）
+data/settings.json
+data/
+
+# 运行日志
+logs/
+
+# 旧命令行版本的会话文件（新版本不再读写）
+route
+jsessionid
+action.log
+
+# 编辑器 / 系统 / 本地工具配置
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.claude/
+
+# 原始下载/备份压缩包（含旧命令行源码，不入版本库）
+*.zip
