@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import random
 import threading
 import time
 from typing import List, Optional
@@ -20,6 +21,7 @@ from .notifier import EmailNotifier
 TERMINAL = {TaskStatus.SUCCEEDED, TaskStatus.STOPPED, TaskStatus.FAILED,
             TaskStatus.MANUAL_ATTENTION}
 EVENT_CAP = 1200
+JITTER = 0.5  # 每次等待叠加的随机抖动（秒）
 
 
 def _ts() -> str:
@@ -156,8 +158,13 @@ class TaskManager:
         task.ended_ts = _ts()
 
     def _wait(self, task: TaskRecord, seconds: float) -> bool:
-        """等待期间可响应停止。返回 True=继续，False=已停止应结束。"""
-        task.cancel.wait(max(0.1, seconds))
+        """等待期间可响应停止。返回 True=继续，False=已停止应结束。
+
+        复刻原版 sleep(4.5 + random()) 的随机抖动：每次等待在
+        基础间隔上叠加 ±JITTER，避免多实例请求命中服务器同一节奏。
+        """
+        sleep_for = max(1.0, seconds + random.uniform(-JITTER, JITTER))
+        task.cancel.wait(sleep_for)
         if task.cancel.is_set():
             self._emit("info", "stopped", "任务已停止。")
             return False
