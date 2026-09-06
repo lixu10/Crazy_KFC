@@ -462,6 +462,7 @@ function syncLocked() {
 let _pollInFlight = false;
 async function pollOnce() {
   if (_pollInFlight) return;   // 上一次请求未返回时不重叠轮询，避免事件重复
+  if (!S.auth.logged_in) return;   // 未登录不轮询任务/事件，避免无谓的 401
   _pollInFlight = true;
   try {
     let data;
@@ -539,6 +540,10 @@ function openSettings() {
   $("inpStudentClass").value = s.student_class || "";
   $("inpInterval").value = s.poll_interval_sec || 5;
   $("chkTls").checked = s.tls_verify === false; // 勾选 = 关闭证书校验
+  const pr = s.proxy || {};
+  $("chkProxy").checked = !!pr.enabled;
+  $("inpProxyUrl").value = "";   // 与授权码一致：留空 = 不修改已保存地址
+  updateProxyNote();
   $("chkEmail").checked = !!s.smtp.enabled;
   $("selSecurity").value = s.smtp.security || "ssl";
   $("inpSmtpServer").value = s.smtp.server || "";
@@ -580,6 +585,14 @@ function buildSettingsBody() {
   const pw = $("inpSmtpPassword").value;
   if (pw) sm.password = pw;
   if (Object.keys(sm).length) body.smtp = sm;
+
+  const curp = cur.proxy || {};
+  const px = {};
+  const pe = $("chkProxy").checked;
+  if (pe !== !!curp.enabled) px.enabled = pe;
+  const purl = $("inpProxyUrl").value.trim();
+  if (purl) px.url = purl;   // 仅当用户填了新地址才下发；空串保留原值
+  if (Object.keys(px).length) body.proxy = px;
   return body;
 }
 
@@ -588,8 +601,33 @@ function updateEmailNote() {
   if (!s) return;
   const has = !!(s.smtp && s.smtp.password_configured);
   $("emailSavedNote").textContent = has
-    ? "已保存授权码（改留空即保留原值）。它保存在本机 data/settings.json，已加入 .gitignore。"
-    : "尚未保存授权码。保存后它仅保存在本机 data/settings.json（已加入 .gitignore），API 不回传。";
+    ? "已保存授权码（输入框留空即保留原值）。它保存在服务器数据目录 data/users/<学号>/settings.json，已加入 .gitignore。"
+    : "尚未保存授权码。保存后它仅保存在服务器数据目录 data/users/<学号>/settings.json（已加入 .gitignore），API 不回传。";
+}
+
+function updateProxyNote() {
+  const s = S.settings;
+  if (!s) return;
+  const pr = s.proxy || {};
+  const note = $("proxyNote");
+  if (!pr.configured) {
+    note.textContent = "未配置代理。启用后，本程序访问统一认证/选课系统的请求会走这里；"
+      + "服务器自身环境变量里的全局代理会被忽略。地址留空即保留已保存值。";
+  } else {
+    note.textContent = (pr.enabled ? "已启用代理：" : "已保存但未启用：")
+      + (pr.url || "(已脱敏)") + "。代理密码不回传，只保存在你的账号设置文件中。";
+  }
+}
+
+async function clearProxy() {
+  try {
+    const s = await api("/api/settings", { method: "PUT", body: { proxy: { enabled: false, url: null } } });
+    S.settings = s;
+    $("chkProxy").checked = false;
+    $("inpProxyUrl").value = "";
+    updateProxyNote();
+    toast("已清除并停用代理");
+  } catch (err) { toast(err.message, "error"); }
 }
 
 async function saveSettings() {
@@ -599,7 +637,9 @@ async function saveSettings() {
     const s = await api("/api/settings", { method: "PUT", body });
     S.settings = s;
     $("inpSmtpPassword").value = "";
+    $("inpProxyUrl").value = "";
     $("settingsDialog").close();
+    updateProxyNote();
     toast("设置已保存", "ok");
     renderAll();
   } catch (err) { toast(err.message, "error"); }
@@ -624,10 +664,39 @@ async function testEmail() {
     }
     const data = await api("/api/settings/email/test", { method: "POST", body: {} });
     $("inpSmtpPassword").value = "";
+    $("inpProxyUrl").value = "";
     updateEmailNote();
+    updateProxyNote();
     toast(data.message, data.message.startsWith("发送成功") ? "ok" : "");
   } catch (err) {
     toast(err.message, "error");
+  }
+}
+
+/* ---------- 访问口令 ---------- */
+function showGate() {
+  const d = $("gateDialog");
+  $("gateState").textContent = "";
+  $("inpGate").value = "";
+  if (!d.open) d.showModal();
+  $("inpGate").focus();
+}
+
+async function submitGate(e) {
+  e.preventDefault();
+  const token = $("inpGate").value;
+  if (!token) { setStateLine("gateState", "请输入口令。", "error"); return; }
+  const btn = $("btnGateOk");
+  btn.disabled = true;
+  try {
+    await api("/api/gate", { method: "POST", body: { token } });
+    $("gateDialog").close();
+    location.reload();   // 简单可靠：口令生效后整页重载进入应用
+  } catch (err) {
+    setStateLine("gateState", err.message, "error");
+    $("inpGate").value = "";
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -671,7 +740,11 @@ function bind() {
   $("btnSaveSettings").addEventListener("click", saveSettings);
   $("btnTestEmail").addEventListener("click", testEmail);
   $("btnClearEmailSecret").addEventListener("click", clearEmailSecret);
+  $("btnClearProxy").addEventListener("click", clearProxy);
   $("formSettings").addEventListener("submit", (e) => e.preventDefault());
+
+  $("formGate").addEventListener("submit", submitGate);
+  $("btnGateCancel").addEventListener("click", () => $("gateDialog").close());
 
   document.addEventListener("visibilitychange", () => {
     clearInterval(window.__pollTimer);
@@ -687,12 +760,20 @@ function startPolling() {
 /* ---------- init ---------- */
 (async function init() {
   bind();
+  let booted = false;
   try {
     await refreshBootstrap();
+    booted = true;
   } catch (err) {
-    toast("无法连接本程序：请确认服务已启动。", "error");
+    if (err.httpStatus === 403) {
+      showGate();   // 需要访问口令：输入后整页重载
+    } else {
+      toast("无法连接本程序：请确认服务已启动。", "error");
+    }
   }
-  startPolling();
-  pollOnce();
+  if (booted) {
+    startPolling();
+    pollOnce();
+  }
   // 队列变化后若处于改选模式且已有旧课程，提示重建
 })();

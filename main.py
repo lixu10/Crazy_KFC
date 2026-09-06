@@ -68,11 +68,13 @@ def main() -> None:
         app.run(host=HOST, port=port, debug=False, use_reloader=False, threaded=True)
     finally:
         try:
-            services = app.config["SERVICES"]
-            tasks = services["tasks"]
-            if tasks.active:
-                tasks.request_stop()
+            users = app.config["USER_MANAGER"]
+            active = [s for s in users.all() if s.tasks.active]
+            for s in active:
+                s.tasks.request_stop()
+            if active:
                 time.sleep(0.6)  # 给临界区一段稳定时间再结束进程
+            users.shutdown()
         except Exception:
             pass
         print("\n已退出。")

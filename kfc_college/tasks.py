@@ -235,7 +235,7 @@ class TaskManager:
                 task.stage = f"接口异常，等待下轮：{e.message}"
                 self._emit("warn", "error", e.message)
             if not self._wait(task, task.interval):
-                return
+                break  # 停止请求在等待中被触发 → 落到循环外的终态收尾，避免卡在 stopping
         self._finish(task, TaskStatus.STOPPED, "已停止")
 
     def _poll_round(self, task: TaskRecord, targets: List[CourseTarget]) -> None:
@@ -296,7 +296,7 @@ class TaskManager:
                                      "抢课队列中的所有课程均已成功选上。")
                 return
             if not self._wait(task, task.interval):
-                return
+                break  # 停止请求在等待中被触发 → 落到循环外的终态收尾，避免卡在 stopping
         if task.status not in TERMINAL:
             succ = sum(1 for st in task.states.values() if st.status == "done")
             self._finish(task, TaskStatus.STOPPED, "已停止",
@@ -375,7 +375,7 @@ class TaskManager:
             if task.status in TERMINAL:
                 return
             if not self._wait(task, task.interval):
-                return
+                break  # 停止请求在等待中被触发 → 落到循环外的终态收尾，避免卡在 stopping
         if task.status not in TERMINAL:
             self._finish(task, TaskStatus.STOPPED, "已停止")
             self._emit("info", "stopped", "改选任务已停止。")

@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+data/
+logs/
+*.zip
+.git/
+.gitignore
+.claude/
+.env
+.DS_Store
+.idea/
+.vscode/
+*.log
+route
+jsessionid
+action.log

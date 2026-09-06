@@ -117,8 +117,31 @@ class ElectionClient:
         return bool(self.cfg.settings.get("tls_verify", True))
 
     # ---------- HTTP ----------
+    def _proxy_url(self) -> str:
+        p = self.cfg.settings.get("proxy", {}) or {}
+        if p.get("enabled") and p.get("url"):
+            return str(p["url"])
+        return ""
+
+    def _new_session(self) -> requests.Session:
+        """构造一个新的 requests.Session：忽略环境变量代理，只按本用户代理配置。"""
+        sess = requests.Session()
+        sess.trust_env = False  # 服务器可能配了全局 HTTP_PROXY，绝不能影响某个用户
+        url = self._proxy_url()
+        sess.proxies = {"http": url, "https": url} if url else {}
+        return sess
+
+    def apply_proxy(self) -> None:
+        """把当前配置的代理即时写进既有会话，无需重新登录。"""
+        url = self._proxy_url()
+        proxies = {"http": url, "https": url} if url else {}
+        for s in (self.sso_session, self.xk_session):
+            if s is not None:
+                s.trust_env = False
+                s.proxies = proxies
+
     def _get(self, url: str, *, session=None, **kw) -> requests.Response:
-        sess = session or requests.Session()
+        sess = session or self._new_session()
         kw.setdefault("timeout", 12)
         try:
             resp = sess.get(url, verify=self._verify(), **kw)
@@ -128,7 +151,7 @@ class ElectionClient:
         return resp
 
     def _post(self, url: str, *, session=None, headers=None, **kw) -> requests.Response:
-        sess = session or (self.xk_session or requests.Session())
+        sess = session or self.xk_session or self._new_session()
         kw.setdefault("timeout", 15)
         try:
             resp = sess.post(url, headers=headers, verify=self._verify(), **kw)
@@ -206,7 +229,7 @@ class ElectionClient:
 
     def _do_login(self) -> None:
         self._captured = []
-        sso = requests.Session()
+        sso = self._new_session()
         self.sso_session = sso
 
         # 1) 取 execution
@@ -264,7 +287,7 @@ class ElectionClient:
         self._captured.append(location)
 
         # 4) 换取 token / JSESSIONID / route（内存 Session 自动维护 Cookie）
-        xk = requests.Session()
+        xk = self._new_session()
         self.xk_session = xk
         try:
             xk.get(XK_CAS, params={"ticket": ticket},
