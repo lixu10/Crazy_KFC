@@ -12,8 +12,9 @@ from flask import Blueprint, current_app, g, jsonify, render_template, request
 
 from .client import AuthExpired, ClientError, LoginError, NetworkError
 from .config import remember_proxy_secret, remember_secret
-from .courses import normalize_section, old_from_selected_row, search_rows, selected_public
-from .models import CourseTarget, ID_TO_TYPE, SwapPair, TaskMode
+from .courses import (normalize_section, old_from_selected_row, search_rows,
+                      selected_public, selected_public_full)
+from .models import CODE_TO_TYPE, CourseTarget, ID_TO_TYPE, SwapPair, TaskMode
 from .sessions import LoginConflict
 
 bp = Blueprint("api", __name__)
@@ -302,6 +303,72 @@ def selected():
         if isinstance(r, dict):
             out.append(selected_public(r))
     return ok({"count": len(out), "sections": out})
+
+
+# 已选课程详情：以“当前学生班级口径”反查选课列表，尽量补全教师/时间/地点/容量。
+_PAGE_SIZE = 999
+_MAX_PAGES = 6
+
+
+def _enrich_selected_detail(c, rows, student_class: str) -> list:
+    """返回与前端可读结构一致的已选课程详情列表（含降级缺省字段）。"""
+    ordered = []
+    want: dict = {}   # jxbid -> class_type（仅已确认的类型代码可反查）
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        ordered.append(r)
+        j = str(r.get("JXBID") or r.get("jxbid") or "")
+        code = str(r.get("teachingClassType") or r.get("clazzType") or "")
+        if j and code in CODE_TO_TYPE and j not in want:
+            want[j] = code
+    # 按类型分组反查（分页直到命中或列表取完），找不到的用降级视图。
+    by_type: dict = {}
+    for j, code in want.items():
+        by_type.setdefault(code, []).append(j)
+    rich: dict = {}
+    for code, jxbids in by_type.items():
+        todo = set(jxbids)
+        for page in range(1, _MAX_PAGES + 1):
+            if not todo:
+                break
+            try:
+                found = c.list_classes(code, page_size=_PAGE_SIZE, page=page)
+            except AuthExpired:
+                raise
+            except ClientError:
+                break   # 该类型列表请求失败：剩余项走降级视图
+            for lr in found:
+                j = str(lr.get("JXBID") or "")
+                if j in todo:
+                    todo.discard(j)
+                    rich[j] = normalize_section(lr, code, student_class)
+            # 返回不足一页 = 已是末页；否则继续翻页，直到命中全部或达到页数上限。
+            if len(found) < _PAGE_SIZE:
+                break
+        # todo 中仍缺的项保持降级视图
+    out = []
+    for r in ordered:
+        j = str(r.get("JXBID") or r.get("jxbid") or "")
+        detail = rich.get(j)
+        out.append(detail if detail is not None else selected_public_full(r))
+    return out
+
+
+@bp.get("/api/courses/selected/detail")
+def selected_detail():
+    c, e = _require_batch()
+    if e:
+        return e
+    try:
+        rows = c.fetch_selected()
+    except AuthExpired:
+        return err("会话已过期，请重新登录。", 401)
+    except ClientError as e:
+        return err(e.message, 502)
+    student_class = str(_user().cfg.settings.get("student_class", ""))
+    sections = _enrich_selected_detail(c, rows, student_class)
+    return ok({"count": len(sections), "sections": sections})
 
 
 # ---- 任务 ----

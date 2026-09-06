@@ -16,6 +16,7 @@
       <span class="pill" id="pillAuth" data-state="idle">认证 · 未登录</span>
       <span class="pill mono" id="pillBatch">批次 · —</span>
       <span class="pill" id="pillTask">任务 · 空闲</span>
+      <button class="ghost" id="btnSelected" type="button" hidden>已选课程</button>
       <button class="ghost" id="btnSettings" type="button">设置</button>
       <button class="ghost danger" id="btnLogout" type="button" hidden>退出登录</button>
     </div>
@@ -156,6 +157,25 @@
       </section>
     </section>
   </main>
+
+  <dialog id="selectedDialog" class="wide">
+    <h2>全部已选课程 <span class="badge" id="selectedCount">0</span></h2>
+    <p class="hint" id="selectedDialogHint">以下为当前统一认证账号已选的教学班。时间/地点/容量按列表反查补齐，容量口径以“设置 → 学生班级”为准。</p>
+    <div class="state-line" id="selectedDialogState"></div>
+    <div class="tablewrap">
+      <table class="grid" id="selectedDetailTable">
+        <thead><tr>
+          <th>课程 / 课序号</th><th>教师</th>
+          <th>时间 / 周次</th><th>地点</th><th class="num">已选/容量</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="button-row end">
+      <button class="secondary" id="btnRefreshSelected" type="button">刷新</button>
+      <button class="ghost" id="btnCloseSelected" type="button">关闭</button>
+    </div>
+  </dialog>
 
   <dialog id="gateDialog">
     <form id="formGate">

@@ -86,12 +86,14 @@ function renderAuth() {
   const btn = $("btnLogout");
   if (S.auth.logged_in) {
     btn.hidden = false;
+    $("btnSelected").hidden = false;
     $("pillAuth").textContent = "认证 · " + (S.auth.user || "已登录");
     $("pillAuth").dataset.state = "ok";
     $("panelLogin").querySelectorAll("input").forEach(i => { i.disabled = true; });
     $("btnLogin").disabled = true;
   } else {
     btn.hidden = true;
+    $("btnSelected").hidden = true;
     $("pillAuth").textContent = "认证 · 未登录";
     $("pillAuth").dataset.state = "idle";
     $("panelLogin").querySelectorAll("input").forEach(i => { i.disabled = false; });
@@ -536,7 +538,11 @@ function syncBatchControls() {
 /* ---------- 设置弹窗 ---------- */
 function openSettings() {
   const s = S.settings;
-  if (!s) return;
+  if (!s) {
+    // 多用户版设置按账号保存：未登录时给明确提示，而不是静默无反应。
+    toast(S.auth.logged_in ? "设置尚未就绪，请刷新页面后重试。" : "请先登录后再打开“设置”。", "error");
+    return;
+  }
   $("inpStudentClass").value = s.student_class || "";
   $("inpInterval").value = s.poll_interval_sec || 5;
   $("chkTls").checked = s.tls_verify === false; // 勾选 = 关闭证书校验
@@ -673,6 +679,62 @@ async function testEmail() {
   }
 }
 
+/* ---------- 已选课程详情 ---------- */
+async function openSelectedDialog() {
+  const d = $("selectedDialog");
+  if (!d.open) d.showModal();
+  await refreshSelectedDetail();
+}
+
+async function refreshSelectedDetail() {
+  setStateLine("selectedDialogState", "正在拉取已选课程与详情…");
+  try {
+    const data = await api("/api/courses/selected/detail");
+    renderSelectedDetail(data.sections || []);
+    setStateLine("selectedDialogState",
+      data.count ? `共 ${data.count} 门已选课程。` : "当前账号还没有已选课程。", "ok");
+  } catch (err) {
+    renderSelectedDetail([]);
+    setStateLine("selectedDialogState", err.message, "error");
+  }
+}
+
+function capacityCell(s) {
+  if (s.capacity === null || s.capacity === undefined) return '<span class="hint">—</span>';
+  const main = `${s.selected ?? "?"}/${s.capacity}` + (s.has_slot ? " 有空" : " 已满");
+  const m = s.has_slot ? `<span class="good">${esc(main)}</span>` : `<span class="bad">${esc(main)}</span>`;
+  const parts = [];
+  const i = s.internal, ex = s.external;
+  if (i && i.capacity !== null && i.capacity !== undefined) parts.push(`内 ${i.selected ?? "?"}/${i.capacity}`);
+  if (ex && ex.capacity !== null && ex.capacity !== undefined) parts.push(`外 ${ex.selected ?? "?"}/${ex.capacity}`);
+  return m + (parts.length ? `<div class="hint">${esc(parts.join(" · "))}</div>` : "");
+}
+
+function renderSelectedDetail(sections) {
+  const tb = $("selectedDetailTable").querySelector("tbody");
+  tb.innerHTML = "";
+  $("selectedCount").textContent = sections.length;
+  sections.forEach((s) => {
+    const tr = document.createElement("tr");
+    const title = esc(s.name || "—");
+    const code = s.code ? ` <span class="mono">${esc(s.code)}</span>` : "";
+    const sub = [];
+    if (s.kxh) sub.push("课序号 " + s.kxh);
+    if (s.type_name) sub.push(s.type_name);
+    const schedule = (s.weeks || s.schedule)
+      ? esc(s.weeks || "") + (s.weeks && s.schedule ? "<br>" : "") + (s.schedule ? esc(s.schedule) : "")
+      : "—";
+    tr.innerHTML = `
+      <td><div><strong>${title}</strong>${code}</div>
+          <div class="hint">${esc(sub.join(" · "))}</div></td>
+      <td>${esc(s.teacher || "—")}</td>
+      <td>${schedule}</td>
+      <td>${esc(s.place || "—")}</td>
+      <td class="num">${capacityCell(s)}</td>`;
+    tb.appendChild(tr);
+  });
+}
+
 /* ---------- 访问口令 ---------- */
 function showGate() {
   const d = $("gateDialog");
@@ -737,6 +799,9 @@ function bind() {
 
   $("btnSettings").addEventListener("click", openSettings);
   $("btnCancelSettings").addEventListener("click", () => $("settingsDialog").close());
+  $("btnSelected").addEventListener("click", openSelectedDialog);
+  $("btnRefreshSelected").addEventListener("click", refreshSelectedDetail);
+  $("btnCloseSelected").addEventListener("click", () => $("selectedDialog").close());
   $("btnSaveSettings").addEventListener("click", saveSettings);
   $("btnTestEmail").addEventListener("click", testEmail);
   $("btnClearEmailSecret").addEventListener("click", clearEmailSecret);

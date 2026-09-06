@@ -479,11 +479,11 @@ class ElectionClient:
         if code == 401 or "token" in msg.lower():
             raise AuthExpired("会话已过期")
 
-    def list_classes(self, class_type_code: str, page_size: int = 999) -> List[dict]:
+    def list_classes(self, class_type_code: str, page_size: int = 999, page: int = 1) -> List[dict]:
         self._require_batch()
         if class_type_code not in CODE_TO_TYPE:
             raise BadResponse(f"未知课程类型 {class_type_code}")
-        body = {"teachingClassType": class_type_code, "pageNumber": 1,
+        body = {"teachingClassType": class_type_code, "pageNumber": page,
                 "pageSize": page_size, "orderBy": "", "campus": "1"}
         resp = self._post(LIST_URL, headers=self._xk_headers(), json=body)
         try:

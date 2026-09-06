@@ -117,3 +117,29 @@ def selected_public(row: dict) -> dict:
         "kxh": str(row.get("KXH") or ""),
         "class_type": str(row.get("teachingClassType") or row.get("clazzType") or ""),
     }
+
+
+def selected_public_full(row: dict) -> dict:
+    """“已选课程详情”的降级视图：当列表里找不到该教学班时使用。
+
+    字段与 normalize_section 对齐（教师/时间/地点/容量等置空），保证前端
+    只用一种结构渲染；容量类字段为 None 表示“未知口径”，界面显示 —。
+    """
+    p = selected_public(row)
+    code = p["class_type"]
+    ref = CODE_TO_TYPE.get(code)
+    p.update({
+        "type_name": ref.name if ref else (code or "未知类型"),
+        "code": str(row.get("KCH") or ""),
+        "teacher": "",
+        "place": "",
+        "weeks": "",
+        "schedule": "",
+        "capacity": None,
+        "selected": None,
+        "has_slot": None,
+        "internal": {"capacity": None, "selected": None},
+        "external": {"capacity": None, "selected": None},
+        "tjbj": "",
+    })
+    return p
