@@ -110,6 +110,13 @@ input::placeholder { color: #9aa8b3; }
 .state-line { font-size: 12.5px; color: var(--ink-soft); margin-top: 8px; min-height: 16px; white-space: pre-wrap; word-break: break-all; }
 .state-line.error { color: var(--danger); }
 .state-line.ok { color: var(--ok); }
+.batch-choice-detail {
+  margin: -2px 0 8px; padding: 9px 10px; min-height: 38px;
+  border: 1px dashed var(--line); border-radius: 7px;
+  color: var(--ink-soft); font-size: 12.5px; white-space: pre-wrap; word-break: break-word;
+}
+.batch-choice-detail .mono { color: var(--ink); }
+.batch-choice-detail .reason { color: var(--warn); }
 
 /* 表格 */
 .tablewrap { overflow-x: auto; margin-top: 10px; border: 1px solid var(--line); border-radius: 8px; }

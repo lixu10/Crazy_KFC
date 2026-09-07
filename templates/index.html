@@ -14,7 +14,7 @@
     </div>
     <div class="rail">
       <span class="pill" id="pillAuth" data-state="idle">认证 · 未登录</span>
-      <span class="pill mono" id="pillBatch">批次 · —</span>
+      <span class="pill" id="pillBatch">批次 · —</span>
       <span class="pill" id="pillTask">任务 · 空闲</span>
       <button class="ghost" id="btnSelected" type="button" hidden>已选课程</button>
       <button class="ghost" id="btnSettings" type="button">设置</button>
@@ -27,7 +27,7 @@
       <section class="panel" id="panelLogin">
         <h2>登录</h2>
         <p class="hint">用你自己的统一认证账号登录；密码仅保存在本程序进程内存中，绝不落盘或回传。</p>
-        <p class="hint">每个学号在服务器上同一时间只允许一个活动会话——若已在别处登录，这里会被拒绝，请先到原处退出。</p>
+        <p class="hint">同一学号可以在多个浏览器同时连接本站；它们共享一套上游登录会话、设置、批次和任务，不会重复登录教务系统。</p>
         <form id="formLogin" autocomplete="off">
           <label>统一认证学号
             <input id="inpUserId" name="userId" required autocomplete="username">
@@ -42,19 +42,30 @@
 
       <section class="panel" id="panelBatch">
         <h2>选课批次</h2>
-        <p class="hint">自动模式下按 “登录捕获 → 上次成功 → 手动值” 依次尝试。</p>
+        <p class="hint">登录成功不等于课程服务已开放。自动模式会读取账号可用批次、逐个验证，并优先恢复上次选择。</p>
         <div class="row radios">
           <label class="radio"><input type="radio" name="batchMode" value="auto" checked>自动发现</label>
           <label class="radio"><input type="radio" name="batchMode" value="manual">手动指定</label>
         </div>
-        <label id="lblManual" class="hidden">批次 ID（32 位十六进制）
-          <input id="inpManualBatch" class="mono" placeholder="粘贴批次 ID">
-        </label>
-        <div class="button-row">
-          <button class="primary" id="btnDiscover" type="button">重新发现批次</button>
-          <button class="secondary" id="btnValidateBatch" type="button">验证并采用</button>
+        <div id="autoBatchBox">
+          <label>发现的批次
+            <select id="selBatchChoice"><option value="">尚未发现可选批次</option></select>
+          </label>
+          <div class="batch-choice-detail" id="batchChoiceDetail"></div>
+          <div class="button-row">
+            <button class="primary" id="btnDiscover" type="button">重新发现批次</button>
+            <button class="secondary" id="btnActivateBatch" type="button">验证并采用所选批次</button>
+          </div>
         </div>
-        <div class="state-line mono" id="batchState"></div>
+        <div id="manualBatchBox" class="hidden">
+          <label>批次 ID
+            <input id="inpManualBatch" class="mono" placeholder="粘贴批次 ID">
+          </label>
+          <div class="button-row">
+            <button class="secondary" id="btnValidateBatch" type="button">验证并采用手动批次</button>
+          </div>
+        </div>
+        <div class="state-line" id="batchState"></div>
       </section>
     </aside>
 

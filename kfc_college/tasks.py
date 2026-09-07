@@ -84,6 +84,7 @@ class TaskManager:
             "started_ts": t.started_ts,
             "ended_ts": t.ended_ts,
             "stop_requested": t.stop_requested,
+            "batch_id": t.batch_id,
             "summary": t.summary,
             "error": t.error,
             "last_check": t.last_check,
@@ -101,6 +102,9 @@ class TaskManager:
             self._next_id += 1
             task.created_ts = _ts()
             task.student_class = student_class or str(self.cfg.settings.get("student_class", ""))
+            task.batch_id = str(self.client.batch_id or "")
+            if not task.batch_id:
+                raise RuntimeError("尚无已验证的活动批次")
             task.interval = max(1.0, float(self.cfg.settings.get("poll_interval_sec", 5)))
             task.cancel = threading.Event()
             if mode == TaskMode.SWAP:
@@ -156,6 +160,29 @@ class TaskManager:
         task.stage = stage
         task.summary = summary or stage
         task.ended_ts = _ts()
+
+    def _handle_client_error(self, task: TaskRecord, exc: ClientError,
+                             prefix: str = "") -> bool:
+        """记录上游错误；返回 True 表示任务应立即结束，避免高频重复事件。"""
+        message = f"{prefix}{exc.message}" if prefix else exc.message
+        # 批次被清除/上游结构变化：任务语义已失效，无法再继续，需终止。
+        terminal = exc.code in {"batch_required", "upstream_schema_changed"}
+        if terminal:
+            self._finish(task, TaskStatus.FAILED, message, message)
+            task.error = exc.message
+            self._emit("error", "error", message)
+            return True
+        if exc.code == "election_not_open":
+            # 尚未开放通常是暂时状态（可能几秒后开放）：任务应等待重试，
+            # 而不是永久失败。同一等待状态只提示一次，避免每秒重复同一条事件。
+            waiting = "选课系统尚未开放，任务继续等待…"
+            if task.stage != waiting:
+                task.stage = waiting
+                self._emit("warn", "wait_not_open", message)
+            return False
+        task.stage = f"接口异常，等待下轮：{exc.message}"
+        self._emit("warn", "error", message)
+        return False
 
     def _wait(self, task: TaskRecord, seconds: float) -> bool:
         """等待期间可响应停止。返回 True=继续，False=已停止应结束。
@@ -232,8 +259,8 @@ class TaskManager:
                     return
                 continue
             except (NetworkError, BadResponse, BatchUnavailable, ClientError) as e:
-                task.stage = f"接口异常，等待下轮：{e.message}"
-                self._emit("warn", "error", e.message)
+                if self._handle_client_error(task, e):
+                    return
             if not self._wait(task, task.interval):
                 break  # 停止请求在等待中被触发 → 落到循环外的终态收尾，避免卡在 stopping
         self._finish(task, TaskStatus.STOPPED, "已停止")
@@ -243,6 +270,8 @@ class TaskManager:
             try:
                 index = self._fetch_map(type_code)
             except (NetworkError, BadResponse, BatchUnavailable, ClientError) as e:
+                if e.code in {"election_not_open", "batch_required", "upstream_schema_changed"}:
+                    raise
                 self._emit("warn", "error", f"类型 {type_code} 查询失败：{e.message}")
                 continue
             for tg in infos:
@@ -283,8 +312,8 @@ class TaskManager:
                     return
                 continue
             except (NetworkError, BadResponse, BatchUnavailable, ClientError) as e:
-                task.stage = f"接口异常，等待下轮：{e.message}"
-                self._emit("warn", "error", e.message)
+                if self._handle_client_error(task, e):
+                    return
                 done = set()
             for key in done:
                 active.pop(key, None)
@@ -371,7 +400,8 @@ class TaskManager:
                     return
                 continue
             except (NetworkError, BadResponse, BatchUnavailable, ClientError) as e:
-                self._emit("warn", "error", f"改选轮询异常：{e.message}")
+                if self._handle_client_error(task, e, "改选轮询异常："):
+                    return
             if task.status in TERMINAL:
                 return
             if not self._wait(task, task.interval):

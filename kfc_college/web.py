@@ -14,7 +14,8 @@ from .client import AuthExpired, ClientError, LoginError, NetworkError
 from .config import remember_proxy_secret, remember_secret
 from .courses import (normalize_section, old_from_selected_row, search_rows,
                       selected_public, selected_public_full)
-from .models import CODE_TO_TYPE, CourseTarget, ID_TO_TYPE, SwapPair, TaskMode
+from .models import (CODE_TO_TYPE, CourseTarget, ID_TO_TYPE, SwapPair,
+                     TaskMode, TaskStatus)
 from .sessions import LoginConflict
 
 bp = Blueprint("api", __name__)
@@ -37,8 +38,15 @@ def ok(data=None):
     return jsonify({"ok": True, "data": data})
 
 
-def err(message: str, status: int = 400):
-    return jsonify({"ok": False, "error": {"message": str(message)}}), status
+def err(message: str, status: int = 400, *, code: str = "request_error",
+        retryable: bool = False):
+    return jsonify({"ok": False, "error": {
+        "code": code, "message": str(message), "retryable": bool(retryable),
+    }}), status
+
+
+def client_err(exc: ClientError):
+    return err(exc.message, exc.http_status, code=exc.code, retryable=exc.retryable)
 
 
 def _mask_id(u: str) -> str:
@@ -76,8 +84,9 @@ def _bootstrap_payload(u) -> dict:
     if u is None:
         return {
             "auth": {"logged_in": False, "user": "", "password_held": False},
-            "batch": {"id": "", "source": "unknown", "validated_ts": "",
-                      "mode": "auto", "manual_id": ""},
+            "batch": {"state": "unavailable", "message": "", "active": None,
+                      "choices": [], "id": "", "name": "", "source": "unknown",
+                      "validated_ts": "", "mode": "auto", "manual_id": ""},
             "settings": None,
             "course_types": course_types,
             "task": None,
@@ -85,19 +94,24 @@ def _bootstrap_payload(u) -> dict:
     c = u.client
     s = u.cfg.public()
     logged = c.authenticated
+    batch = c.batch_runtime()
+    active = batch.get("active") or {}
+    batch.update({
+        # 保留旧前端字段兼容，但它们只代表已验证活动批次，绝不回退到 manual_id。
+        "id": active.get("id", ""),
+        "name": active.get("name", ""),
+        "source": active.get("source", "unknown"),
+        "validated_ts": active.get("validated_ts", ""),
+        "mode": s.get("batch_mode"),
+        "manual_id": s.get("batch_manual_id"),
+    })
     return {
         "auth": {
             "logged_in": logged,
             "user": _mask_id(c.user_id) if c.user_id else "",
             "password_held": c.password_held,
         },
-        "batch": {
-            "id": c.batch_id if c.batch_id else (s.get("batch_manual_id") if s.get("batch_mode") == "manual" else ""),
-            "source": c.batch_source if c.batch_id else "unknown",
-            "validated_ts": c.batch_validated_ts,
-            "mode": s.get("batch_mode"),
-            "manual_id": s.get("batch_manual_id"),
-        },
+        "batch": batch,
         "settings": s,
         "course_types": course_types,
         "task": u.tasks.summary(),
@@ -141,7 +155,7 @@ def update_settings():
     blocked = [k for k in ("student_class", "batch_mode", "batch_manual_id", "poll_interval_sec")
                if k in payload and running]
     if blocked:
-        return err("任务运行期间不能修改：" + "、".join(blocked), 409)
+        return err("任务运行期间不能修改：" + "、".join(blocked), 409, code="task_active")
     rejected = cfg.update(payload)
     if rejected:
         return err("设置中有字段不合法：" + "、".join(rejected), 422)
@@ -174,17 +188,27 @@ def login():
     proxy = body.get("proxy")
     if not isinstance(proxy, dict):
         proxy = None
+    current = _user()
+    if current is not None:
+        if current.uid != user_id:
+            return err("当前浏览器已登录其他账号，请先退出。", 409, code="login_conflict")
+        if not current.verify_held_password(password):
+            return err("统一认证用户名或密码错误。", 401, code="invalid_credentials")
+        payload = _bootstrap_payload(current)
+        payload["attached"] = True
+        return ok(payload)
     try:
-        sess = _manager().login(user_id, password, proxy=proxy)
+        sess, sid, attached = _manager().login_or_attach(user_id, password, proxy=proxy)
     except LoginConflict as e:
-        return err(e.message, 409)
-    except LoginError as e:
-        return err(e.message, 401)
-    except NetworkError as e:
-        return err(e.message, 502)
+        return err(e.message, 409, code="login_conflict")
+    except (LoginError, NetworkError) as e:
+        return client_err(e)
     g.sess = sess
-    g._set_sid = sess.sid
-    return ok(_bootstrap_payload(sess))
+    g.sid = sid
+    g._set_sid = sid
+    payload = _bootstrap_payload(sess)
+    payload["attached"] = attached
+    return ok(payload)
 
 
 @bp.post("/api/auth/relogin")
@@ -193,37 +217,73 @@ def relogin():
     password = str(body.get("password", ""))
     if not password:
         return err("请输入密码。", 422)
-    c = _user().client
+    u = _user()
+    c = u.client
     if not c.user_id:
         return err("尚未登录，无法重登。", 401)
-    c.set_password(password)
-    if c.relogin():
+    # 手动重登只应在会话失效/任务等待登录时进行：同一上游会话被多个浏览器共享，
+    # 任务正常运行中无端重登会替换共享 token 并打断正在执行的任务。
+    if u.tasks.active:
+        t = getattr(u.tasks, "task", None)
+        waiting = t is not None and getattr(t, "status", "") == TaskStatus.WAITING_LOGIN
+        if not waiting:
+            return err("任务运行中且会话正常，无需手动重登；如需更换密码请先停止任务。",
+                       409, code="task_active")
+    # 密码“先试后存”：认证成功才替换账号级持有的密码/会话；
+    # 失败时 client.relogin 恢复原 token 与会话，避免单个浏览器输错密码
+    # 破坏其他浏览器和正在运行的任务。
+    if c.relogin(password):
         return ok({"message": "重新登录成功，任务已恢复。", "logged_in": True})
     return err(c.last_login_error or "重新登录失败。", 401)
 
 
 @bp.post("/api/auth/logout")
 def logout():
-    u = _user()
-    if u.tasks.active:
-        return err("任务运行中，请先停止任务再退出登录。", 409)
-    _manager().logout(u)
+    try:
+        closed = _manager().detach(getattr(g, "sid", None))
+    except LoginConflict as e:
+        return err(e.message, 409, code="task_active")
     g.sess = None
+    g.sid = None
     g._clear_sid = True
-    return ok({"message": "已退出登录。"})
+    message = "已退出当前浏览器。" if not closed else "已退出登录。"
+    return ok({"message": message, "account_closed": closed})
 
 
 # ---- 批次 ----
+def _batch_change_guard(u):
+    if u.tasks.active:
+        return err("任务运行期间不能发现、验证或切换批次。", 409, code="task_active")
+    if not u.client.authenticated:
+        return err("请先登录。", 401, code="auth_expired")
+    return None
+
+
 @bp.post("/api/batch/discover")
 def discover():
-    c = _user().client
-    if not c.authenticated:
-        return err("请先登录。", 401)
+    u = _user()
+    blocked = _batch_change_guard(u)
+    if blocked:
+        return blocked
     try:
-        result = c.discover_batch()
+        return ok({"batch": u.client.discover_batch()})
     except ClientError as e:
-        return err(e.message, 502)
-    return ok(result)
+        return client_err(e)
+
+
+@bp.post("/api/batch/activate")
+def activate_batch():
+    u = _user()
+    blocked = _batch_change_guard(u)
+    if blocked:
+        return blocked
+    batch_id = str((request.get_json(silent=True) or {}).get("batch_id", "")).strip()
+    if not batch_id:
+        return err("请选择批次。", 422, code="invalid_batch")
+    try:
+        return ok({"batch": u.client.activate_batch(batch_id)})
+    except ClientError as e:
+        return client_err(e)
 
 
 @bp.post("/api/batch/validate")
@@ -231,29 +291,33 @@ def validate_manual():
     body = request.get_json(silent=True) or {}
     batch_id = str(body.get("batch_id", "")).strip()
     if not batch_id:
-        return err("请输入批次 ID。", 422)
+        return err("请输入批次 ID。", 422, code="invalid_batch")
     u = _user()
+    blocked = _batch_change_guard(u)
+    if blocked:
+        return blocked
     c = u.client
-    if not c.authenticated:
-        return err("请先登录。", 401)
-    # 保存为手动模式与手动值，然后验证；不静默覆盖用户手动输入。
-    u.cfg.update({"batch_mode": "manual", "batch_manual_id": batch_id})
     res = c.validate_batch(batch_id)
-    if res["ok"]:
-        c._apply_batch(batch_id, "manual")
-        return ok({"ok": True, "batch_id": batch_id, "source": "manual", "message": "批次有效，已采用。"})
-    if res.get("reason") == "auth":
-        return err("会话已过期，请重新登录后再验证批次。", 401)
-    return err(f"批次校验失败：{res.get('msg', '')}", 422)
+    if not res["ok"]:
+        status = 401 if res.get("reason") == "auth" else (409 if res.get("reason") == "not_open" else 422)
+        return err(res.get("msg", "批次校验失败。"), status,
+                   code=res.get("code", "invalid_batch"),
+                   retryable=res.get("retryable", False))
+    # 远端验证成功后才同时更新运行态和持久化手动配置。
+    c._apply_batch(batch_id, "manual")
+    u.cfg.update({"batch_mode": "manual", "batch_manual_id": batch_id})
+    return ok({"batch": c.batch_runtime(), "message": "批次有效，已采用。"})
 
 
 # ---- 课程 ----
 def _require_batch():
     c = _user().client
     if not c.authenticated:
-        return None, err("请先登录。", 401)
-    if not c.batch_id:
-        return None, err("尚无有效批次：请自动发现或在设置中手动填写并验证。", 409)
+        return None, err("请先登录。", 401, code="auth_expired")
+    if not c.batch_id or c.batch_state != "ready":
+        code = "election_not_open" if c.batch_state == "not_open" else "batch_required"
+        return None, err(c.batch_message or "尚无有效批次，请先发现、选择或手动验证。",
+                         409, code=code, retryable=(code == "election_not_open"))
     return c, None
 
 
@@ -278,10 +342,8 @@ def search():
     student_class = str(_user().cfg.settings.get("student_class", ""))
     try:
         rows = c.list_classes(code)
-    except AuthExpired:
-        return err("会话已过期，请重新登录。", 401)
     except ClientError as e:
-        return err(e.message, 502)
+        return client_err(e)
     matched = search_rows(rows, name)
     out = [normalize_section(r, code, student_class) for r in matched]
     return ok({"count": len(out), "sections": out[:200]})
@@ -294,10 +356,8 @@ def selected():
         return e
     try:
         rows = c.fetch_selected()
-    except AuthExpired:
-        return err("会话已过期，请重新登录。", 401)
     except ClientError as e:
-        return err(e.message, 502)
+        return client_err(e)
     out = []
     for r in rows:
         if isinstance(r, dict):
@@ -362,10 +422,8 @@ def selected_detail():
         return e
     try:
         rows = c.fetch_selected()
-    except AuthExpired:
-        return err("会话已过期，请重新登录。", 401)
     except ClientError as e:
-        return err(e.message, 502)
+        return client_err(e)
     student_class = str(_user().cfg.settings.get("student_class", ""))
     sections = _enrich_selected_detail(c, rows, student_class)
     return ok({"count": len(sections), "sections": sections})
@@ -387,7 +445,7 @@ def create_task():
         return e
     tasks = u.tasks
     if tasks.active:
-        return err("已有任务在运行，请先停止。", 409)
+        return err("已有任务在运行，请先停止。", 409, code="task_active")
     body = request.get_json(silent=True) or {}
     mode = str(body.get("mode", ""))
     if mode not in (TaskMode.POLL, TaskMode.GRAB, TaskMode.SWAP):
@@ -429,11 +487,9 @@ def create_task():
     except ValueError as ex:
         return err(str(ex), 422)
     except RuntimeError as ex:
-        return err(str(ex), 409)
-    except AuthExpired:
-        return err("会话已过期，请重新登录。", 401)
+        return err(str(ex), 409, code="task_active")
     except ClientError as e:
-        return err(e.message, 502)
+        return client_err(e)
     return ok(tasks.summary())
 
 

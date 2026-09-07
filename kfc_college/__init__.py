@@ -10,7 +10,8 @@ import os
 from flask import Flask, g, jsonify, request
 
 from .config import BASE_DIR, DATA_DIR, setup_logging
-from .sessions import SID_COOKIE, UserManager
+from .sessions import (DEFAULT_IDLE_TTL, DEFAULT_REAP_INTERVAL, SID_COOKIE,
+                       UserManager)
 
 _SID_MAX_AGE = int(os.getenv("SID_MAX_AGE", "2592000"))   # 30 天；本地/服务器通用
 _COOKIE_SECURE = os.getenv("COOKIE_SECURE", "").lower() in ("1", "true", "yes")
@@ -29,14 +30,15 @@ def create_app(data_dir: str = None,
     access_token = (access_token if access_token is not None
                     else (os.getenv("ACCESS_TOKEN") or None))
 
-    users = UserManager(
-        data_dir,
-        client_factory=client_factory,
-        notifier_factory=notifier_factory,
-        task_factory=task_factory,
-        idle_ttl=idle_ttl,
-        reaper_interval=reaper_interval,
-    )
+    manager_kw = {
+        "client_factory": client_factory,
+        "notifier_factory": notifier_factory,
+        "task_factory": task_factory,
+        "idle_ttl": DEFAULT_IDLE_TTL if idle_ttl is None else idle_ttl,
+        "reaper_interval": (DEFAULT_REAP_INTERVAL if reaper_interval is None
+                            else reaper_interval),
+    }
+    users = UserManager(data_dir, **manager_kw)
 
     # 模板与静态文件位于项目根目录，而不是本包内。
     app = Flask(__name__,
@@ -58,6 +60,7 @@ def create_app(data_dir: str = None,
     @app.before_request
     def _bind_request():
         g.sess = None
+        g.sid = None
         g._set_sid = None
         g._clear_sid = False
 
@@ -75,6 +78,7 @@ def create_app(data_dir: str = None,
             if sess is not None:
                 sess.touch()
                 g.sess = sess
+                g.sid = sid
         return None
 
     @app.after_request

@@ -33,6 +33,7 @@ _DEFAULT = {
     "batch_mode": "auto",          # auto | manual
     "batch_manual_id": "",
     "batch_last_id": "",
+    "batch_last_name": "",
     "poll_interval_sec": 5,
     "tls_verify": True,            # 默认开启证书校验；特殊网络环境可关闭
     # 网络代理（每用户独立；凭据可持久化，界面与 API 不回传明文）
@@ -70,6 +71,8 @@ def _coerce(raw: dict) -> dict:
     merged = _merge(_DEFAULT, raw)
     merged["schema_version"] = SCHEMA_VERSION
     merged["batch_mode"] = "manual" if merged.get("batch_mode") == "manual" else "auto"
+    for field in ("batch_manual_id", "batch_last_id", "batch_last_name"):
+        merged[field] = str(merged.get(field, "") or "").strip()
     merged["poll_interval_sec"] = max(1, int(float(merged.get("poll_interval_sec", 5) or 5)))
     merged["tls_verify"] = bool(merged.get("tls_verify", True))
     proxy = merged.setdefault("proxy", {})
@@ -104,7 +107,7 @@ class ConfigStore:
             pass
         except (json.JSONDecodeError, ValueError, OSError) as e:
             logging.getLogger("app").warning("读取设置失败，使用默认值: %s", e)
-        return dict(_DEFAULT)
+        return _coerce({})
 
     def save(self) -> None:
         with _lock:
