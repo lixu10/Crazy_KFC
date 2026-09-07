@@ -5,7 +5,7 @@ const S = {
   courseTypes: [],
   auth: { logged_in: false, user: "", password_held: false },
   settings: null,
-  batch: { id: "", source: "unknown", validated_ts: "", mode: "auto", manual_id: "" },
+  batch: { state: "unavailable", message: "", active: null, choices: [], id: "", name: "", source: "unknown", validated_ts: "", mode: "auto", manual_id: "" },
   queue: [],          // 加入目标队列的教学班（规范化对象，含 class_type/jxbid/name/kxh）
   selected: [],       // 已选课程（用于改选）
   pairs: [],          // 改选对 { old, target }
@@ -16,6 +16,7 @@ const S = {
   lastPillAuth: "",
   busy: false,
 };
+let _authRefreshing = false;   // 防止 api() 在 auth_expired 时无限递归刷新 bootstrap
 
 const MODE_NAMES = { grab: "抢课", poll: "仅监控", swap: "安全改选" };
 const STATUS_ZH = {
@@ -24,8 +25,10 @@ const STATUS_ZH = {
   failed: "已失败", manual_attention: "需要人工处理",
 };
 const SOURCE_ZH = {
+  account_elective: "账号普通批次", account_experimental: "账号实验批次",
+  student_info: "账号批次", elective_user: "账号上下文", landing: "页面解析",
   login_location: "登录捕获", html: "页面解析", last_success: "上次成功",
-  legacy: "兼容候选", manual: "手动指定", unknown: "未设置",
+  legacy: "兼容候选", manual: "手动指定", default: "当前默认", unknown: "未设置",
 };
 const TERMINAL_STATUS = new Set(["succeeded", "stopped", "failed", "manual_attention"]);
 const SUBJECT_ZH = {
@@ -53,9 +56,20 @@ async function api(path, opts = {}) {
   let j = null;
   try { j = await r.json(); } catch (e) { /* ignore */ }
   if (j && j.ok === true) return j.data;
-  const msg = (j && j.error && j.error.message) || `请求失败（HTTP ${r.status}）`;
+  const info = (j && j.error) || {};
+  const msg = info.message || `请求失败（HTTP ${r.status}）`;
   const er = new Error(msg);
+  er.code = info.code || "http_error";
+  er.retryable = !!info.retryable;
   er.httpStatus = r.status;
+  // 会话被顶下线/过期时（auth_expired），顺带刷新 bootstrap，让批次条变红并
+  // 弹出“会话已过期/被顶下线 → 重新登录”的入口，而不是停留在绿色 ready。
+  if (er.code === "auth_expired" && path !== "/api/bootstrap" && path !== "/api/auth/login"
+      && !_authRefreshing) {
+    _authRefreshing = true;
+    refreshBootstrap().catch(() => resetAccountState())
+      .finally(() => { _authRefreshing = false; });
+  }
   throw er;
 }
 
@@ -80,18 +94,35 @@ function renderAll() {
   renderQueue();
   renderModePanel();
   renderTask();
+  updateReloginBar();
+}
+
+/* 重新登录条：任务“等待重新登录”时，或会话被顶下线/过期（空闲无任务）时显示。 */
+let _reloginBarShown = false;   // 只在重新登录条“变为可见”那一刻聚焦，避免每次轮询抢焦点
+function updateReloginBar() {
+  const bar = $("reloginBar");
+  if (!bar) return;
+  const t = S.task;
+  const waiting = !!(t && t.status === "waiting_login");
+  const expired = S.auth.logged_in && !!S.batch && S.batch.state === "auth_expired";
+  const show = waiting || (expired && !S.active);
+  bar.classList.toggle("hidden", !show);
+  if (show && !_reloginBarShown) $("inpReloginPwd").focus();
+  _reloginBarShown = show;
 }
 
 function renderAuth() {
   const btn = $("btnLogout");
   if (S.auth.logged_in) {
     btn.hidden = false;
+    $("btnSelected").hidden = false;
     $("pillAuth").textContent = "认证 · " + (S.auth.user || "已登录");
     $("pillAuth").dataset.state = "ok";
     $("panelLogin").querySelectorAll("input").forEach(i => { i.disabled = true; });
     $("btnLogin").disabled = true;
   } else {
     btn.hidden = true;
+    $("btnSelected").hidden = true;
     $("pillAuth").textContent = "认证 · 未登录";
     $("pillAuth").dataset.state = "idle";
     $("panelLogin").querySelectorAll("input").forEach(i => { i.disabled = false; });
@@ -100,16 +131,83 @@ function renderAuth() {
   if ($("inpPassword").value && !S.auth.logged_in) { $("inpPassword").value = ""; }
 }
 
+function activeBatch() {
+  if (S.batch.active) return S.batch.active;
+  if (!S.batch.id) return null;
+  return { id: S.batch.id, name: S.batch.name || "", display_name: S.batch.display_name || "", source: S.batch.source, validated_ts: S.batch.validated_ts };
+}
+
 function renderBatchPill() {
   const p = $("pillBatch");
-  const id = S.batch.id || (S.batch.mode === "manual" ? S.batch.manual_id || "" : "");
-  const tag = id ? (id.length > 8 ? id.slice(-8) : id) : "—";
-  const srcZh = SOURCE_ZH[S.batch.source] || S.batch.source || "未设置";
-  p.textContent = id ? `批次 · ${tag}（${srcZh}）` : "批次 · 未设置";
-  p.dataset.state = id ? (S.batch.source === "unknown" ? "warn" : "ok") : "idle";
-  $("batchState").textContent = id
-    ? `当前：${id}（来源 ${srcZh}${S.batch.validated_ts ? " · " + S.batch.validated_ts : ""}）`
-    : "尚未取得有效批次";
+  const b = activeBatch();
+  const state = S.batch.state || (b ? "ready" : "unavailable");
+  if (b && state === "ready") {
+    const label = b.name || b.display_name || `批次 …${String(b.id).slice(-8)}`;
+    p.textContent = `批次 · ${label}`;
+    p.dataset.state = state === "ready" ? "ok" : "warn";
+    const srcZh = SOURCE_ZH[b.source] || b.source || "未知来源";
+    const when = b.validated_ts || S.batch.validated_ts || "";
+    $("batchState").textContent = `当前：${label} · ID …${String(b.id).slice(-8)} · ${srcZh}${when ? " · " + when + " 验证" : ""}`;
+    $("batchState").className = "state-line ok";
+  } else {
+    const labels = {
+      selection_required: "发现多个有效批次，请选择后采用",
+      not_open: "统一认证已成功，但课程服务尚未开放",
+      auth_expired: "会话已过期，请重新登录",
+      unavailable: "暂时没有可用批次",
+    };
+    p.textContent = state === "selection_required" ? "批次 · 待选择"
+      : state === "not_open" ? "批次 · 尚未开放"
+      : state === "auth_expired" ? "批次 · 会话已过期" : "批次 · 未就绪";
+    p.dataset.state = state === "auth_expired" || state === "unavailable" ? "err" : "warn";
+    $("batchState").textContent = S.batch.message || labels[state] || "尚未取得有效批次";
+    $("batchState").className = "state-line" + (state === "unavailable" || state === "auth_expired" ? " error" : "");
+  }
+  renderBatchChoices();
+}
+
+function choiceLabel(c) {
+  const name = c.name || c.display_name || `批次 …${String(c.id || "").slice(-8)}（名称未获取）`;
+  const category = c.category === "experimental" ? "实验" : (c.category === "elective" ? "普通" : "");
+  return `${name}${category ? " · " + category : ""} · …${String(c.id || "").slice(-8)}`;
+}
+
+function renderBatchChoices() {
+  const sel = $("selBatchChoice");
+  if (!sel) return;
+  const previous = sel.value;
+  const choices = S.batch.choices || [];
+  sel.innerHTML = "";
+  if (!choices.length) {
+    const o = document.createElement("option");
+    o.value = ""; o.textContent = "尚未发现可选批次";
+    sel.appendChild(o);
+  } else {
+    choices.forEach((c) => {
+      const o = document.createElement("option");
+      o.value = c.id; o.textContent = choiceLabel(c);
+      o.disabled = c.can_select === false || (c.need_confirm && !c.is_confirmed) || c.status === "invalid";
+      sel.appendChild(o);
+    });
+    const active = activeBatch();
+    const wanted = choices.some(c => c.id === previous) ? previous : (active && active.id);
+    if (wanted && choices.some(c => c.id === wanted)) sel.value = wanted;
+  }
+  renderBatchChoiceDetail();
+}
+
+function renderBatchChoiceDetail() {
+  const box = $("batchChoiceDetail");
+  if (!box) return;
+  const c = (S.batch.choices || []).find(x => x.id === $("selBatchChoice").value);
+  if (!c) { box.textContent = "重新发现后会在这里显示账号可用批次及其状态。"; return; }
+  const parts = [];
+  if (c.begin_time || c.end_time) parts.push(`时间：${c.begin_time || "?"} — ${c.end_time || "?"}`);
+  parts.push(`ID：${c.id}`);
+  if (c.status_message || c.message) parts.push(c.status_message || c.message);
+  if (c.no_select_reason) parts.push(`不可选：${c.no_select_reason}`);
+  if ((c.need_confirm && !c.is_confirmed)) parts.push("该批次需要先在官方选课页面确认通知。本站不会代为确认。");
+  box.textContent = parts.join("\n");
 }
 
 /* ---------- 登录 ---------- */
@@ -125,14 +223,22 @@ async function doLogin(e) {
     }});
     applyBootstrap(data);
     $("inpPassword").value = "";
-    setStateLine("loginState", "登录成功，正在使用发现的批次。", "ok");
-    toast("登录成功", "ok");
+    const attached = !!data.attached;
+    const state = S.batch.state || (activeBatch() ? "ready" : "unavailable");
+    const b = activeBatch();
+    let message = attached ? "已连接该账号现有的本站会话。" : "统一认证登录成功。";
+    if (state === "ready" && b) message += ` 当前批次：${b.name || b.display_name || "…" + String(b.id).slice(-8)}。`;
+    else if (state === "selection_required") message += ` 发现 ${(S.batch.choices || []).length} 个批次，请选择。`;
+    else if (state === "not_open") message += " 课程服务尚未开放，已保留登录状态。";
+    else message += " 暂未取得可用批次。";
+    setStateLine("loginState", message, state === "unavailable" ? "" : "ok");
+    toast(attached ? "已连接现有账号会话" : "登录成功", "ok");
   } catch (err) {
     setStateLine("loginState", err.message, "error");
     toast(err.message, "error");
   } finally {
     S.busy = false;
-    btn.disabled = false; btn.textContent = "登录并发现批次";
+    btn.disabled = !!S.auth.logged_in; btn.textContent = "登录并发现批次";
   }
 }
 
@@ -151,7 +257,7 @@ async function doResume() {
     await api("/api/auth/relogin", { method: "POST", body: { password: pwd } });
     $("inpReloginPwd").value = "";
     await refreshBootstrap();
-    toast("已恢复任务", "ok");
+    toast(S.active ? "已恢复任务" : "已恢复会话", "ok");
   } catch (err) { toast(err.message, "error"); }
 }
 
@@ -175,12 +281,25 @@ async function doDiscover() {
   $("batchState").textContent = "正在尝试自动发现…";
   try {
     const data = await api("/api/batch/discover", { method: "POST", body: {} });
-    if (data.ok) {
-      toast("批次发现成功（" + data.source + "）", "ok");
-    } else {
-      setStateLine("batchState", data.msg || "未发现有效批次", "error");
-    }
+    if (data && data.batch) S.batch = data.batch;
     await refreshBootstrap();
+    if (S.batch.state === "ready") toast("批次发现并验证成功", "ok");
+    else if (S.batch.state === "selection_required") toast("发现多个有效批次，请选择");
+    else setStateLine("batchState", S.batch.message || "未发现有效批次", S.batch.state === "not_open" ? "" : "error");
+  } catch (err) {
+    setStateLine("batchState", err.message, "error");
+  }
+}
+
+async function doActivateBatch() {
+  const id = $("selBatchChoice").value;
+  if (!id) { toast("请选择可用批次", "error"); return; }
+  setStateLine("batchState", "正在重新验证并采用所选批次…");
+  try {
+    await api("/api/batch/activate", { method: "POST", body: { batch_id: id } });
+    await refreshBootstrap();
+    const b = activeBatch();
+    toast(`已采用 ${b ? (b.name || b.display_name || "所选批次") : "所选批次"}`, "ok");
   } catch (err) {
     setStateLine("batchState", err.message, "error");
   }
@@ -204,26 +323,32 @@ async function doSearch(e) {
   e.preventDefault();
   const name = $("inpSearchName").value.trim();
   const typeId = parseInt($("selType").value, 10);
-  if (!name) { toast("请输入课程名称或代码", "error"); return; }
   if (Number.isNaN(typeId)) { toast("请选择课程类型", "error"); return; }
-  setStateLine("searchState", "搜索中…");
+  setStateLine("searchState", name ? "搜索中…" : "正在加载该类型全部课程…");
   try {
     const data = await api("/api/courses/search", { method: "POST", body: { name, class_type_id: typeId } });
     $("resultWrap").classList.remove("hidden");
-    renderResults(data.sections || []);
-    setStateLine("searchState", data.count === 0 ? "未找到精确匹配的教学班。" : "找到 " + data.count + " 个教学班。", data.count ? "ok" : "");
-    if (!data.sections || !data.sections.length) $("resultWrap").classList.add("hidden");
+    renderResults(data.sections || [], data.count || 0);
+    const shown = (data.sections || []).length;
+    let msg;
+    if (!data.count) msg = "未找到匹配的课程（可留空列出该类型全部）。";
+    else if (data.truncated) msg = `匹配 ${data.count} 个教学班，仅显示前 ${shown} 个。`;
+    else msg = `共 ${data.count} 个教学班，可多选加入目标。`;
+    setStateLine("searchState", msg, data.count ? "ok" : "");
+    if (!shown) $("resultWrap").classList.add("hidden");
   } catch (err) {
     $("resultWrap").classList.add("hidden");
     setStateLine("searchState", err.message, "error");
   }
 }
 
-function renderResults(sections) {
+function renderResults(sections, total) {
   const tb = $("resultTable").querySelector("tbody");
   tb.innerHTML = "";
   if (!sections || !sections.length) { $("resultCount").textContent = "无结果"; return; }
-  $("resultCount").textContent = `本次结果 ${sections.length} 个，可多选加入目标。`;
+  $("resultCount").textContent = total == null || total === sections.length
+    ? `共 ${sections.length} 个教学班，可多选加入目标。`
+    : `匹配 ${total} 个，当前显示 ${sections.length} 个，可多选加入目标。`;
   sections.forEach((s) => {
     const tr = document.createElement("tr");
     const mark = s.has_slot ? `<span class="good">${s.selected}/${s.capacity} 有空</span>`
@@ -402,7 +527,7 @@ function renderTask() {
     meta.textContent = "尚无任务";
     $("taskStatesWrap").classList.add("hidden");
     stop.hidden = true;
-    reloginBar.classList.add("hidden");
+    updateReloginBar();
     setStateLine("taskState", "未启动任务。先在左侧登录并获得批次，然后搜索加入目标。", "");
     $("pillTask").textContent = "任务 · 空闲";
     $("pillTask").dataset.state = "idle";
@@ -416,7 +541,7 @@ function renderTask() {
     : (t.status === "succeeded") ? "ok" : "idle";
   stop.hidden = !S.active;
   stop.textContent = t.stop_requested ? "正在安全停止…" : "停止任务";
-  reloginBar.classList.toggle("hidden", t.status !== "waiting_login");
+  updateReloginBar();
   const bits = [`#${t.id} · ${MODE_NAMES[t.mode] || t.mode} · ${STATUS_ZH[t.status] || t.status}`];
   if (t.started_ts) bits.push("开始 " + t.started_ts);
   if (t.stage) bits.push("当前：" + t.stage);
@@ -452,8 +577,10 @@ function renderTask() {
 function syncLocked() {
   const act = !!S.active;
   document.querySelectorAll('input[name="mode"]').forEach(r => { r.disabled = act; });
-  ["btnStart", "btnAddSelected", "btnClearQueue", "btnLoadSelected", "btnBuildPairs"]
+  ["btnStart", "btnAddSelected", "btnClearQueue", "btnLoadSelected", "btnBuildPairs",
+   "btnDiscover", "btnActivateBatch", "btnValidateBatch", "selBatchChoice", "inpManualBatch"]
     .forEach((id) => { const el = $(id); if (el) el.disabled = act; });
+  document.querySelectorAll('input[name="batchMode"]').forEach(r => { r.disabled = act; });
   $("queueList").querySelectorAll("button").forEach((b) => { b.disabled = act; });
   $("resultTable").querySelectorAll(".rowsel").forEach((b) => { b.disabled = act; });
 }
@@ -462,11 +589,17 @@ function syncLocked() {
 let _pollInFlight = false;
 async function pollOnce() {
   if (_pollInFlight) return;   // 上一次请求未返回时不重叠轮询，避免事件重复
+  if (!S.auth.logged_in) return;   // 未登录不轮询任务/事件，避免无谓的 401
   _pollInFlight = true;
   try {
     let data;
     try { data = await api("/api/tasks/current"); }
-    catch (e) { return; }
+    catch (e) {
+      if (e.httpStatus === 401) {
+        try { await refreshBootstrap(); } catch (_) { resetAccountState(); renderAll(); }
+      }
+      return;
+    }
     S.task = data;
     renderTask();
 
@@ -499,13 +632,49 @@ async function refreshBootstrap() {
   return data;
 }
 
-function applyBootstrap(d) {
-  S.courseTypes = d.course_types || S.courseTypes;
-  S.auth = d.auth || S.auth;
-  S.settings = d.settings || S.settings;
-  S.batch = d.batch || S.batch;
-  S.task = d.task || null;
+function resetAccountState() {
+  S.settings = null;
+  S.batch = { state: "unavailable", message: "", active: null, choices: [], id: "", name: "", source: "unknown", validated_ts: "", mode: "auto", manual_id: "" };
+  S.queue = [];
+  S.selected = [];
   S.pairs = [];
+  S.task = null;
+  S.active = false;
+  S.lastSeq = 0;
+  S.eventsRendered = 0;
+  $("eventList").innerHTML = "";
+  $("resultTable").querySelector("tbody").innerHTML = "";
+  $("resultWrap").classList.add("hidden");
+  setStateLine("searchState", "", "");
+  renderSelectedTable();
+  renderSelectedDetail([]);
+  setStateLine("selectedDialogState", "", "");
+}
+
+function clearBatchScopedState() {
+  S.queue = [];
+  S.selected = [];
+  S.pairs = [];
+  $("resultTable").querySelector("tbody").innerHTML = "";
+  $("resultWrap").classList.add("hidden");
+  setStateLine("searchState", "批次已切换，请重新搜索课程。", "");
+  renderSelectedTable();
+  renderSelectedDetail([]);
+}
+
+function applyBootstrap(d) {
+  const previousAuth = S.auth || {};
+  const previousBatch = activeBatch();
+  const nextAuth = d.auth || { logged_in: false, user: "", password_held: false };
+  const accountChanged = previousAuth.logged_in && (!nextAuth.logged_in || previousAuth.user !== nextAuth.user);
+  if (accountChanged) resetAccountState();
+  S.courseTypes = d.course_types ?? S.courseTypes;
+  S.auth = nextAuth;
+  S.settings = d.settings ?? null;
+  S.batch = d.batch ?? S.batch;
+  S.task = d.task ?? null;
+  const nextBatch = activeBatch();
+  if (!accountChanged && previousBatch && previousBatch.id !== (nextBatch?.id || "")) clearBatchScopedState();
   if (S.mode === "swap") renderPairsBuilt();
   fillTypeSelect();
   syncBatchControls();
@@ -528,17 +697,27 @@ function syncBatchControls() {
   const mode = (S.settings && S.settings.batch_mode) || "auto";
   const radios = document.querySelectorAll('input[name="batchMode"]');
   radios.forEach(r => { r.checked = r.value === mode; });
-  $("lblManual").classList.toggle("hidden", mode !== "manual");
+  $("autoBatchBox").classList.toggle("hidden", mode === "manual");
+  $("manualBatchBox").classList.toggle("hidden", mode !== "manual");
   $("inpManualBatch").value = (S.settings && S.settings.batch_manual_id) || "";
+  renderBatchChoices();
 }
 
 /* ---------- 设置弹窗 ---------- */
 function openSettings() {
   const s = S.settings;
-  if (!s) return;
+  if (!s) {
+    // 多用户版设置按账号保存：未登录时给明确提示，而不是静默无反应。
+    toast(S.auth.logged_in ? "设置尚未就绪，请刷新页面后重试。" : "请先登录后再打开“设置”。", "error");
+    return;
+  }
   $("inpStudentClass").value = s.student_class || "";
   $("inpInterval").value = s.poll_interval_sec || 5;
   $("chkTls").checked = s.tls_verify === false; // 勾选 = 关闭证书校验
+  const pr = s.proxy || {};
+  $("chkProxy").checked = !!pr.enabled;
+  $("inpProxyUrl").value = "";   // 与授权码一致：留空 = 不修改已保存地址
+  updateProxyNote();
   $("chkEmail").checked = !!s.smtp.enabled;
   $("selSecurity").value = s.smtp.security || "ssl";
   $("inpSmtpServer").value = s.smtp.server || "";
@@ -580,6 +759,14 @@ function buildSettingsBody() {
   const pw = $("inpSmtpPassword").value;
   if (pw) sm.password = pw;
   if (Object.keys(sm).length) body.smtp = sm;
+
+  const curp = cur.proxy || {};
+  const px = {};
+  const pe = $("chkProxy").checked;
+  if (pe !== !!curp.enabled) px.enabled = pe;
+  const purl = $("inpProxyUrl").value.trim();
+  if (purl) px.url = purl;   // 仅当用户填了新地址才下发；空串保留原值
+  if (Object.keys(px).length) body.proxy = px;
   return body;
 }
 
@@ -588,8 +775,33 @@ function updateEmailNote() {
   if (!s) return;
   const has = !!(s.smtp && s.smtp.password_configured);
   $("emailSavedNote").textContent = has
-    ? "已保存授权码（改留空即保留原值）。它保存在本机 data/settings.json，已加入 .gitignore。"
-    : "尚未保存授权码。保存后它仅保存在本机 data/settings.json（已加入 .gitignore），API 不回传。";
+    ? "已保存授权码（输入框留空即保留原值）。它保存在服务器数据目录 data/users/<学号>/settings.json，已加入 .gitignore。"
+    : "尚未保存授权码。保存后它仅保存在服务器数据目录 data/users/<学号>/settings.json（已加入 .gitignore），API 不回传。";
+}
+
+function updateProxyNote() {
+  const s = S.settings;
+  if (!s) return;
+  const pr = s.proxy || {};
+  const note = $("proxyNote");
+  if (!pr.configured) {
+    note.textContent = "未配置代理。启用后，本程序访问统一认证/选课系统的请求会走这里；"
+      + "服务器自身环境变量里的全局代理会被忽略。地址留空即保留已保存值。";
+  } else {
+    note.textContent = (pr.enabled ? "已启用代理：" : "已保存但未启用：")
+      + (pr.url || "(已脱敏)") + "。代理密码不回传，只保存在你的账号设置文件中。";
+  }
+}
+
+async function clearProxy() {
+  try {
+    const s = await api("/api/settings", { method: "PUT", body: { proxy: { enabled: false, url: null } } });
+    S.settings = s;
+    $("chkProxy").checked = false;
+    $("inpProxyUrl").value = "";
+    updateProxyNote();
+    toast("已清除并停用代理");
+  } catch (err) { toast(err.message, "error"); }
 }
 
 async function saveSettings() {
@@ -599,7 +811,9 @@ async function saveSettings() {
     const s = await api("/api/settings", { method: "PUT", body });
     S.settings = s;
     $("inpSmtpPassword").value = "";
+    $("inpProxyUrl").value = "";
     $("settingsDialog").close();
+    updateProxyNote();
     toast("设置已保存", "ok");
     renderAll();
   } catch (err) { toast(err.message, "error"); }
@@ -624,10 +838,95 @@ async function testEmail() {
     }
     const data = await api("/api/settings/email/test", { method: "POST", body: {} });
     $("inpSmtpPassword").value = "";
+    $("inpProxyUrl").value = "";
     updateEmailNote();
+    updateProxyNote();
     toast(data.message, data.message.startsWith("发送成功") ? "ok" : "");
   } catch (err) {
     toast(err.message, "error");
+  }
+}
+
+/* ---------- 已选课程详情 ---------- */
+async function openSelectedDialog() {
+  const d = $("selectedDialog");
+  if (!d.open) d.showModal();
+  await refreshSelectedDetail();
+}
+
+async function refreshSelectedDetail() {
+  setStateLine("selectedDialogState", "正在拉取已选课程与详情…");
+  try {
+    const data = await api("/api/courses/selected/detail");
+    renderSelectedDetail(data.sections || []);
+    setStateLine("selectedDialogState",
+      data.count ? `共 ${data.count} 门已选课程。` : "当前账号还没有已选课程。", "ok");
+  } catch (err) {
+    renderSelectedDetail([]);
+    setStateLine("selectedDialogState", err.message, "error");
+  }
+}
+
+function capacityCell(s) {
+  if (s.capacity === null || s.capacity === undefined) return '<span class="hint">—</span>';
+  const main = `${s.selected ?? "?"}/${s.capacity}` + (s.has_slot ? " 有空" : " 已满");
+  const m = s.has_slot ? `<span class="good">${esc(main)}</span>` : `<span class="bad">${esc(main)}</span>`;
+  const parts = [];
+  const i = s.internal, ex = s.external;
+  if (i && i.capacity !== null && i.capacity !== undefined) parts.push(`内 ${i.selected ?? "?"}/${i.capacity}`);
+  if (ex && ex.capacity !== null && ex.capacity !== undefined) parts.push(`外 ${ex.selected ?? "?"}/${ex.capacity}`);
+  return m + (parts.length ? `<div class="hint">${esc(parts.join(" · "))}</div>` : "");
+}
+
+function renderSelectedDetail(sections) {
+  const tb = $("selectedDetailTable").querySelector("tbody");
+  tb.innerHTML = "";
+  $("selectedCount").textContent = sections.length;
+  sections.forEach((s) => {
+    const tr = document.createElement("tr");
+    const title = esc(s.name || "—");
+    const code = s.code ? ` <span class="mono">${esc(s.code)}</span>` : "";
+    const sub = [];
+    if (s.kxh) sub.push("课序号 " + s.kxh);
+    if (s.type_name) sub.push(s.type_name);
+    const schedule = (s.weeks || s.schedule)
+      ? esc(s.weeks || "") + (s.weeks && s.schedule ? "<br>" : "") + (s.schedule ? esc(s.schedule) : "")
+      : "—";
+    tr.innerHTML = `
+      <td><div><strong>${title}</strong>${code}</div>
+          <div class="hint">${esc(sub.join(" · "))}</div></td>
+      <td>${esc(s.teacher || "—")}</td>
+      <td>${schedule}</td>
+      <td>${esc(s.place || "—")}</td>
+      <td class="num">${capacityCell(s)}</td>`;
+    tb.appendChild(tr);
+  });
+}
+
+/* ---------- 访问口令 ---------- */
+function showGate() {
+  const d = $("gateDialog");
+  $("gateState").textContent = "";
+  $("inpGate").value = "";
+  if (!d.open) d.showModal();
+  $("inpGate").focus();
+}
+
+async function submitGate(e) {
+  e.preventDefault();
+  const token = $("inpGate").value;
+  if (!token) { setStateLine("gateState", "请输入口令。", "error"); return; }
+  const btn = $("btnGateOk");
+  btn.disabled = true;
+  try {
+    await api("/api/gate", { method: "POST", body: { token } });
+    $("gateDialog").close();
+    location.reload();   // 简单可靠：口令生效后整页重载进入应用
+  } catch (err) {
+    setStateLine("gateState", err.message, "error");
+    $("inpGate").value = "";
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -642,6 +941,8 @@ function bind() {
     r.addEventListener("change", () => changeBatchMode(r.value));
   });
   $("btnDiscover").addEventListener("click", doDiscover);
+  $("btnActivateBatch").addEventListener("click", doActivateBatch);
+  $("selBatchChoice").addEventListener("change", renderBatchChoiceDetail);
   $("btnValidateBatch").addEventListener("click", doValidateManual);
 
   $("formSearch").addEventListener("submit", doSearch);
@@ -668,10 +969,17 @@ function bind() {
 
   $("btnSettings").addEventListener("click", openSettings);
   $("btnCancelSettings").addEventListener("click", () => $("settingsDialog").close());
+  $("btnSelected").addEventListener("click", openSelectedDialog);
+  $("btnRefreshSelected").addEventListener("click", refreshSelectedDetail);
+  $("btnCloseSelected").addEventListener("click", () => $("selectedDialog").close());
   $("btnSaveSettings").addEventListener("click", saveSettings);
   $("btnTestEmail").addEventListener("click", testEmail);
   $("btnClearEmailSecret").addEventListener("click", clearEmailSecret);
+  $("btnClearProxy").addEventListener("click", clearProxy);
   $("formSettings").addEventListener("submit", (e) => e.preventDefault());
+
+  $("formGate").addEventListener("submit", submitGate);
+  $("btnGateCancel").addEventListener("click", () => $("gateDialog").close());
 
   document.addEventListener("visibilitychange", () => {
     clearInterval(window.__pollTimer);
@@ -687,12 +995,20 @@ function startPolling() {
 /* ---------- init ---------- */
 (async function init() {
   bind();
+  let booted = false;
   try {
     await refreshBootstrap();
+    booted = true;
   } catch (err) {
-    toast("无法连接本程序：请确认服务已启动。", "error");
+    if (err.httpStatus === 403) {
+      showGate();   // 需要访问口令：输入后整页重载
+    } else {
+      toast("无法连接本程序：请确认服务已启动。", "error");
+    }
   }
-  startPolling();
-  pollOnce();
+  if (booted) {
+    startPolling();
+    pollOnce();
+  }
   // 队列变化后若处于改选模式且已有旧课程，提示重建
 })();

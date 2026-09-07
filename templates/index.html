@@ -14,8 +14,9 @@
     </div>
     <div class="rail">
       <span class="pill" id="pillAuth" data-state="idle">认证 · 未登录</span>
-      <span class="pill mono" id="pillBatch">批次 · —</span>
+      <span class="pill" id="pillBatch">批次 · —</span>
       <span class="pill" id="pillTask">任务 · 空闲</span>
+      <button class="ghost" id="btnSelected" type="button" hidden>已选课程</button>
       <button class="ghost" id="btnSettings" type="button">设置</button>
       <button class="ghost danger" id="btnLogout" type="button" hidden>退出登录</button>
     </div>
@@ -25,7 +26,8 @@
     <aside class="side">
       <section class="panel" id="panelLogin">
         <h2>登录</h2>
-        <p class="hint">登录后密码仅保存在本程序内存中。</p>
+        <p class="hint">用你自己的统一认证账号登录；密码仅保存在本程序进程内存中，绝不落盘或回传。</p>
+        <p class="hint">同一学号可以在多个浏览器同时连接本站；它们共享一套上游登录会话、设置、批次和任务，不会重复登录教务系统。</p>
         <form id="formLogin" autocomplete="off">
           <label>统一认证学号
             <input id="inpUserId" name="userId" required autocomplete="username">
@@ -40,19 +42,30 @@
 
       <section class="panel" id="panelBatch">
         <h2>选课批次</h2>
-        <p class="hint">自动模式下按 “登录捕获 → 上次成功 → 手动值” 依次尝试。</p>
+        <p class="hint">登录成功不等于课程服务已开放。自动模式会读取账号可用批次、逐个验证，并优先恢复上次选择。</p>
         <div class="row radios">
           <label class="radio"><input type="radio" name="batchMode" value="auto" checked>自动发现</label>
           <label class="radio"><input type="radio" name="batchMode" value="manual">手动指定</label>
         </div>
-        <label id="lblManual" class="hidden">批次 ID（32 位十六进制）
-          <input id="inpManualBatch" class="mono" placeholder="粘贴批次 ID">
-        </label>
-        <div class="button-row">
-          <button class="primary" id="btnDiscover" type="button">重新发现批次</button>
-          <button class="secondary" id="btnValidateBatch" type="button">验证并采用</button>
+        <div id="autoBatchBox">
+          <label>发现的批次
+            <select id="selBatchChoice"><option value="">尚未发现可选批次</option></select>
+          </label>
+          <div class="batch-choice-detail" id="batchChoiceDetail"></div>
+          <div class="button-row">
+            <button class="primary" id="btnDiscover" type="button">重新发现批次</button>
+            <button class="secondary" id="btnActivateBatch" type="button">验证并采用所选批次</button>
+          </div>
         </div>
-        <div class="state-line mono" id="batchState"></div>
+        <div id="manualBatchBox" class="hidden">
+          <label>批次 ID
+            <input id="inpManualBatch" class="mono" placeholder="粘贴批次 ID">
+          </label>
+          <div class="button-row">
+            <button class="secondary" id="btnValidateBatch" type="button">验证并采用手动批次</button>
+          </div>
+        </div>
+        <div class="state-line" id="batchState"></div>
       </section>
     </aside>
 
@@ -63,8 +76,8 @@
           <label class="grow1">课程类型
             <select id="selType"></select>
           </label>
-          <label class="grow2">课程完整名称或课程代码
-            <input id="inpSearchName" placeholder="例：高等数学 或 B2B011010">
+          <label class="grow2">课程名/代码/教师（可片段，留空=浏览该类型全部）
+            <input id="inpSearchName" placeholder="例：数据 / B060031011 / 张老师；留空列出全部">
           </label>
           <div class="self-end"><button class="primary" id="btnSearch" type="submit">搜索</button></div>
         </form>
@@ -138,10 +151,10 @@
         <h2>任务状态与事件</h2>
         <div class="subpanel hidden" id="reloginBar">
           <div class="row">
-            <label class="grow2">会话已过期，重新输入统一认证密码以恢复任务
+            <label class="grow2">会话已过期或被其他登录顶下线（如刚在官方选课站登录过），重新输入统一认证密码以继续
               <input id="inpReloginPwd" type="password" autocomplete="off">
             </label>
-            <div class="self-end"><button class="primary" id="btnResume" type="button">恢复任务</button></div>
+            <div class="self-end"><button class="primary" id="btnResume" type="button">重新登录</button></div>
           </div>
         </div>
         <div class="task-meta mono" id="taskMeta">尚无任务</div>
@@ -156,6 +169,40 @@
     </section>
   </main>
 
+  <dialog id="selectedDialog" class="wide">
+    <h2>全部已选课程 <span class="badge" id="selectedCount">0</span></h2>
+    <p class="hint" id="selectedDialogHint">以下为当前统一认证账号已选的教学班。时间/地点/容量按列表反查补齐，容量口径以“设置 → 学生班级”为准。</p>
+    <div class="state-line" id="selectedDialogState"></div>
+    <div class="tablewrap">
+      <table class="grid" id="selectedDetailTable">
+        <thead><tr>
+          <th>课程 / 课序号</th><th>教师</th>
+          <th>时间 / 周次</th><th>地点</th><th class="num">已选/容量</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="button-row end">
+      <button class="secondary" id="btnRefreshSelected" type="button">刷新</button>
+      <button class="ghost" id="btnCloseSelected" type="button">关闭</button>
+    </div>
+  </dialog>
+
+  <dialog id="gateDialog">
+    <form id="formGate">
+      <h2>访问口令</h2>
+      <p class="hint">此服务设置了访问口令，输入后才能使用。</p>
+      <label>口令
+        <input id="inpGate" type="password" autocomplete="off">
+      </label>
+      <div class="state-line" id="gateState"></div>
+      <div class="button-row end">
+        <button class="ghost" id="btnGateCancel" type="button">取消</button>
+        <button class="primary" id="btnGateOk" type="submit">进入</button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog id="settingsDialog">
     <form id="formSettings">
       <h2>设置</h2>
@@ -168,6 +215,18 @@
         </label>
         <label class="check"><input id="chkTls" type="checkbox"> 关闭 HTTPS 证书校验（特殊网络才需要）</label>
       </div>
+      <fieldset>
+        <legend>网络代理（按账号独立）</legend>
+        <label class="check"><input id="chkProxy" type="checkbox"> 启用代理</label>
+        <label>代理地址
+          <input id="inpProxyUrl" type="text" autocomplete="off"
+                 placeholder="http://用户名:密码@主机:端口（留空 = 保持已保存的地址）">
+        </label>
+        <p class="hint" id="proxyNote"></p>
+        <div class="button-row">
+          <button class="ghost" id="btnClearProxy" type="button">清除已保存代理</button>
+        </div>
+      </fieldset>
       <fieldset>
         <legend>邮件通知（SMTP）</legend>
         <div class="row2">
@@ -189,7 +248,7 @@
                  placeholder="留空表示不修改已保存的授权码">
         </label>
         <label>收件邮箱 <input id="inpReceiver" type="email"></label>
-        <p class="hint" id="emailSavedNote">授权码按你的选择保存在本机 data/settings.json（已加入 .gitignore）。</p>
+        <p class="hint" id="emailSavedNote">授权码按你的选择保存在服务器数据目录 data/users/&lt;学号&gt;/settings.json（已加入 .gitignore）。</p>
         <div class="button-row">
           <button class="secondary" id="btnTestEmail" type="button">发送测试邮件</button>
           <button class="ghost" id="btnClearEmailSecret" type="button">清除已保存授权码</button>

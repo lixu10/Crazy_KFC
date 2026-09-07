@@ -1,0 +1,19 @@
+services:
+  web:
+    build: .
+    container_name: kfc-college
+    restart: unless-stopped
+    ports:
+      - "8642:8642"
+    environment:
+      # 可选访问口令：不设 = 完全开放；设了则需先输入口令才能使用（登录页前的闸门）。
+      ACCESS_TOKEN: ${ACCESS_TOKEN:-}
+      # 反向代理已启用 HTTPS 时建议置 1，让 kfc_sid / kfc_gate Cookie 带 Secure。
+      # COOKIE_SECURE: "1"
+      # SID_MAX_AGE: "2592000"
+    volumes:
+      # 每用户设置（含 SMTP 授权码 / 代理凭据）持久化在这里。
+      - kfc_data:/app/data
+
+volumes:
+  kfc_data:

@@ -1,8 +1,9 @@
 """本地配置存储：默认值、校验、原子保存、脱敏输出，以及进程日志配置。
 
 统一认证密码、token、cookie、secretVal 一律不持久化。
-SMTP 授权码按用户选择保存在本机 data/settings.json（仅本机文件，被 .gitignore 排除），
-页面与 API 读取时只返回“是否已配置”。
+SMTP 授权码与代理凭据按用户选择保存在各用户的数据文件
+（data/users/<学号>/settings.json，被 .gitignore 排除），
+页面与 API 读取时只返回“是否已配置 / 脱敏后的代理地址”。
 """
 from __future__ import annotations
 
@@ -12,6 +13,8 @@ import os
 import tempfile
 import threading
 from logging.handlers import RotatingFileHandler
+from typing import Optional
+from urllib.parse import urlsplit, urlunsplit
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -30,8 +33,14 @@ _DEFAULT = {
     "batch_mode": "auto",          # auto | manual
     "batch_manual_id": "",
     "batch_last_id": "",
+    "batch_last_name": "",
     "poll_interval_sec": 5,
     "tls_verify": True,            # 默认开启证书校验；特殊网络环境可关闭
+    # 网络代理（每用户独立；凭据可持久化，界面与 API 不回传明文）
+    "proxy": {
+        "enabled": False,
+        "url": "",                 # http://用户名:密码@主机:端口
+    },
     # SMTP
     "smtp": {
         "enabled": True,
@@ -62,8 +71,15 @@ def _coerce(raw: dict) -> dict:
     merged = _merge(_DEFAULT, raw)
     merged["schema_version"] = SCHEMA_VERSION
     merged["batch_mode"] = "manual" if merged.get("batch_mode") == "manual" else "auto"
+    for field in ("batch_manual_id", "batch_last_id", "batch_last_name"):
+        merged[field] = str(merged.get(field, "") or "").strip()
     merged["poll_interval_sec"] = max(1, int(float(merged.get("poll_interval_sec", 5) or 5)))
     merged["tls_verify"] = bool(merged.get("tls_verify", True))
+    proxy = merged.setdefault("proxy", {})
+    if not isinstance(proxy, dict):
+        proxy = merged["proxy"] = {}
+    proxy["enabled"] = bool(proxy.get("enabled", False))
+    proxy["url"] = str(proxy.get("url", "") or "")
     smtp = merged.setdefault("smtp", {})
     smtp["enabled"] = bool(smtp.get("enabled", True))
     smtp["security"] = "starttls" if smtp.get("security") == "starttls" else "ssl"
@@ -91,7 +107,7 @@ class ConfigStore:
             pass
         except (json.JSONDecodeError, ValueError, OSError) as e:
             logging.getLogger("app").warning("读取设置失败，使用默认值: %s", e)
-        return dict(_DEFAULT)
+        return _coerce({})
 
     def save(self) -> None:
         with _lock:
@@ -128,6 +144,18 @@ class ConfigStore:
                     rejected.append("poll_interval_sec")
             if "tls_verify" in patch:
                 merged["tls_verify"] = bool(patch["tls_verify"])
+            if "proxy" in patch and isinstance(patch["proxy"], dict):
+                px = patch["proxy"]
+                tgt = merged.setdefault("proxy", {})
+                if "enabled" in px:
+                    tgt["enabled"] = bool(px["enabled"])
+                if "url" in px:
+                    # 空字符串表示“不修改当前代理地址”；显式 null 表示清除。
+                    v = px["url"]
+                    if v is None:
+                        tgt["url"] = ""
+                    elif str(v).strip() != "":
+                        tgt["url"] = str(v).strip()
             if "smtp" in patch and isinstance(patch["smtp"], dict):
                 sm = patch["smtp"]
                 tgt = merged.setdefault("smtp", {})
@@ -154,7 +182,7 @@ class ConfigStore:
 
     # ---- 查询 ----
     def public(self) -> dict:
-        """返回给前端的脱敏设置：绝不包含授权码明文。"""
+        """返回给前端的脱敏设置：绝不包含授权码/代理密码明文。"""
         s = self.settings
         smtp = s["smtp"]
         return {
@@ -163,6 +191,7 @@ class ConfigStore:
             "batch_manual_id": s.get("batch_manual_id", ""),
             "poll_interval_sec": s.get("poll_interval_sec", 5),
             "tls_verify": s.get("tls_verify", True),
+            "proxy": _proxy_public(s.get("proxy", {})),
             "smtp": {
                 "enabled": smtp["enabled"],
                 "server": smtp["server"],
@@ -173,6 +202,28 @@ class ConfigStore:
                 "password_configured": bool(smtp.get("password", "")),
             },
         }
+
+
+def _proxy_public(p: dict) -> dict:
+    """脱敏后的代理视图：url 里的 userinfo 密码用 *** 遮住。"""
+    p = p or {}
+    enabled = bool(p.get("enabled", False))
+    url = str(p.get("url", "") or "")
+    if not url:
+        return {"enabled": enabled, "configured": False, "url": ""}
+    try:
+        parts = urlsplit(url)
+        netloc = parts.hostname or ""
+        if parts.port:
+            netloc += f":{parts.port}"
+        if parts.username or parts.password:
+            user = parts.username or ""
+            auth = f"{user}:***" if user else "***"
+            netloc = f"{auth}@{netloc}"
+        url = urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+    except ValueError:
+        pass
+    return {"enabled": enabled, "configured": True, "url": url}
 
 
 # ---- 日志 ----
@@ -188,6 +239,28 @@ def remember_secret(value: str) -> None:
         mid = value[len(value) // 3: len(value) - len(value) // 3]
         if len(mid) >= 4:
             _SECRET_SNIPPETS.add(mid)
+
+
+def _url_userinfo(url) -> Optional[tuple]:
+    """从代理 URL 里取出 (用户名, 密码)；无 userinfo 返回 None。"""
+    try:
+        parts = urlsplit(str(url or ""))
+    except ValueError:
+        return None
+    if parts.username or parts.password:
+        return (parts.username or ""), (parts.password or "")
+    return None
+
+
+def remember_proxy_secret(url) -> None:
+    """登记代理 URL 中的凭据，供日志脱敏（登记“密码”与“用户名:密码”）。"""
+    ui = _url_userinfo(url)
+    if not ui:
+        return
+    user, pwd = ui
+    for frag in (pwd, f"{user}:{pwd}"):
+        if frag and len(frag) >= 4:
+            remember_secret(frag)
 
 
 class RedactingFilter(logging.Filter):

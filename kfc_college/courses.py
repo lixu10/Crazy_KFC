@@ -37,16 +37,9 @@ def _sksj(row: dict) -> dict:
     return {}
 
 
-def matches_query(row: dict, query: str) -> bool:
-    """保持原有语义：课程完整名称或课程代码精确匹配。"""
-    if not query:
-        return False
-    q = query.strip()
-    s = _sksj(row)
-    if s.get("KCM") == q or s.get("KCH") == q:
-        return True
-    # 兼容字段直接位于行顶层的情况
-    return row.get("KCM") == q or row.get("KCH") == q
+def _frag(value) -> str:
+    """规整用于搜索的文本：去首尾及内部空白、转小写。"""
+    return "".join(str(value or "").split()).lower()
 
 
 def normalize_section(row: dict, class_type_code: str, student_class: str) -> dict:
@@ -77,8 +70,28 @@ def normalize_section(row: dict, class_type_code: str, student_class: str) -> di
 
 
 def search_rows(rows: List[dict], query: str) -> List[dict]:
-    """返回 rows 中与 query 精确匹配的教学班行。"""
-    return [r for r in rows if isinstance(r, dict) and r.get("SKSJ") and matches_query(r, query)]
+    """在教学班行中做“包含”模糊匹配：课程名/课程代码/教师命中任一即算。
+
+    留空 query 时返回全部行，供“浏览该类型全部课程”使用。逐字规整空白与大写，
+    因此“数据”、“数据结构与算法”、课程代码片段、教师姓名片段都可命中。
+    """
+    q = _frag(query)
+    out: List[dict] = []
+    for r in rows:
+        if not isinstance(r, dict) or not r.get("SKSJ"):
+            continue
+        if not q:
+            out.append(r)
+            continue
+        s = _sksj(r)
+        hay = _frag(" ".join((
+            str(s.get("KCM") or r.get("KCM") or ""),
+            str(s.get("KCH") or r.get("KCH") or ""),
+            str(s.get("SKJS") or r.get("SKJS") or ""),
+        )))
+        if q in hay:
+            out.append(r)
+    return out
 
 
 def to_target(sec: dict) -> CourseTarget:
@@ -117,3 +130,29 @@ def selected_public(row: dict) -> dict:
         "kxh": str(row.get("KXH") or ""),
         "class_type": str(row.get("teachingClassType") or row.get("clazzType") or ""),
     }
+
+
+def selected_public_full(row: dict) -> dict:
+    """“已选课程详情”的降级视图：当列表里找不到该教学班时使用。
+
+    字段与 normalize_section 对齐（教师/时间/地点/容量等置空），保证前端
+    只用一种结构渲染；容量类字段为 None 表示“未知口径”，界面显示 —。
+    """
+    p = selected_public(row)
+    code = p["class_type"]
+    ref = CODE_TO_TYPE.get(code)
+    p.update({
+        "type_name": ref.name if ref else (code or "未知类型"),
+        "code": str(row.get("KCH") or ""),
+        "teacher": "",
+        "place": "",
+        "weeks": "",
+        "schedule": "",
+        "capacity": None,
+        "selected": None,
+        "has_slot": None,
+        "internal": {"capacity": None, "selected": None},
+        "external": {"capacity": None, "selected": None},
+        "tjbj": "",
+    })
+    return p

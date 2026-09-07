@@ -1,6 +1,9 @@
 # 虚拟环境
 .venv/
 
+# 环境变量（可能含 ACCESS_TOKEN 等口令）
+.env
+
 # Python 缓存
 __pycache__/
 *.py[cod]

@@ -110,6 +110,13 @@ input::placeholder { color: #9aa8b3; }
 .state-line { font-size: 12.5px; color: var(--ink-soft); margin-top: 8px; min-height: 16px; white-space: pre-wrap; word-break: break-all; }
 .state-line.error { color: var(--danger); }
 .state-line.ok { color: var(--ok); }
+.batch-choice-detail {
+  margin: -2px 0 8px; padding: 9px 10px; min-height: 38px;
+  border: 1px dashed var(--line); border-radius: 7px;
+  color: var(--ink-soft); font-size: 12.5px; white-space: pre-wrap; word-break: break-word;
+}
+.batch-choice-detail .mono { color: var(--ink); }
+.batch-choice-detail .reason { color: var(--warn); }
 
 /* 表格 */
 .tablewrap { overflow-x: auto; margin-top: 10px; border: 1px solid var(--line); border-radius: 8px; }
@@ -170,6 +177,9 @@ dialog {
 }
 dialog::backdrop { background: rgba(23,43,58,.35); }
 dialog h2 { margin-bottom: 14px; }
+dialog.wide { width: min(980px, 96vw); }
+dialog .tablewrap { max-height: 60vh; overflow-y: auto; }
+dialog .badge { font-size: 12px; padding: 2px 10px; }
 dialog fieldset { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin: 6px 0 4px; }
 dialog legend { font-size: 13px; color: var(--ink-soft); padding: 0 6px; }
 .check { display: inline-flex; margin-top: 22px; }

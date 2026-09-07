@@ -166,6 +166,7 @@ class TaskRecord:
     ended_ts: str = ""
     stage: str = ""
     stop_requested: bool = False
+    batch_id: str = ""                              # 启动时固定的批次，防止运行中被切换
     targets: list = field(default_factory=list)      # list[CourseTarget]（swap 时为各对 target 的扁平展示）
     swap_pairs: list = field(default_factory=list)   # list[SwapPair]
     states: dict = field(default_factory=dict)       # key -> TargetState
