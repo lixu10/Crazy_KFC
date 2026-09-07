@@ -292,6 +292,17 @@ class ElectionClient:
             # （HTML 而非 JSON）：按“请求未获准访问该数据接口”分类，而不是笼统
             # 报“无法识别的页面”。只有无法解析为 JSON 的页面才做这种整页判断；
             # 成功 JSON 中的课程名或某个不可选批次原因可能同样包含“未开放”等词。
+            #
+            # 关键区分：已采用 ready 批次后数据接口仍被退回首页，几乎总是因为选课
+            # 会话被顶下线或已失效（官方站同一账号只允许单点登录，新登录会挤掉旧
+            # 会话），而不是轮次未开放——轮次未开放时发现阶段就会落在 not_open 而
+            # 不会进入 ready。此时必须报 auth_expired：任务才会自动重登或进入“等待
+            # 重新登录”，空闲浏览也才会给出重新登录入口，而不是误导性地提示
+            # “尚未开放”（这正是“用完本工具再去官方站登录后，回到本工具误报未开
+            # 放”的根因）。
+            if self.batch_state == "ready" and self._is_profile_landing(final):
+                raise AuthExpired("选课会话已被其他登录顶下线或已过期（如在官方选课站重新登录过），"
+                                  "请重新登录后重试。")
             bounced = self._profile_bounce_error(final, text)
             if bounced is not None:
                 raise bounced
@@ -315,17 +326,22 @@ class ElectionClient:
         if _code(payload) == "401" or "token" in msg.lower() or _contains_any(msg, _AUTH_WORDS):
             raise AuthExpired("统一认证会话已过期，请重新登录。")
 
+    def _is_profile_landing(self, final) -> bool:
+        """是否最终落在选课 SPA 首页（/xsxk/profile/...），用于识别“请求被退回”。"""
+        netloc = str(getattr(final, "netloc", "") or "").lower()
+        path = str(getattr(final, "path", "") or "")
+        return netloc == "byxk.buaa.edu.cn" and "/xsxk/profile/" in path
+
     def _profile_bounce_error(self, final, text: str):
         """数据接口被 302 退回选课 SPA 首页（/xsxk/profile/index.html）时分类。
 
-        requests 默认跟随 302，最终落在 profile 首页：此时响应是 HTML 而非 JSON。
-        认证态下该页会内嵌 var batch/currentBatch（账号权威当前批次）；若无内嵌批次，
-        说明会话已不被选课服务接受。返回 ClientError 表示命中该情形，否则返回 None
+        用于**尚未采用 ready 批次**的发现/验证阶段：该页内嵌的 var batch 只是页面
+        级默认批次（可能是对本账号关闭的诱饵），认证仍可成立。已采用 ready 批次后
+        数据接口被退回，属会话失效，由 _response_json 里的 ready 分支直接判
+        auth_expired，不走这里。返回 ClientError 表示命中该情形，否则返回 None
         交普通非 JSON 分支处理（未开放/维护/无法识别）。
         """
-        netloc = str(getattr(final, "netloc", "") or "").lower()
-        path = str(getattr(final, "path", "") or "")
-        if netloc != "byxk.buaa.edu.cn" or "/xsxk/profile/" not in path:
+        if not self._is_profile_landing(final):
             return None
         seeds = self._inline_batch_choices(text)
         if not seeds:

@@ -49,6 +49,35 @@ def client_err(exc: ClientError):
     return err(exc.message, exc.http_status, code=exc.code, retryable=exc.retryable)
 
 
+def _read_with_session_heal(fn):
+    """只读数据接口的会话自愈：被官方站顶下线后，选课会话已失效但账号级
+    ElectionClient 内存仍持有密码。
+
+    规则：遇到 AuthExpired 且当前无任务运行、内存持密码时，静默重新登录并重试
+    一次（相当于用户回到本工具时把上游登录“抢回来”）；无任务时重登失败的，
+    把批次运行态标为 auth_expired，供前端显示“会话已过期/被顶下线”并给出重新
+    登录入口。任务运行中不在这里重登——由任务自身的自动重登统一处理，避免同一
+    账号会话被两个线程重复替换 token。
+    """
+    try:
+        return fn()
+    except AuthExpired as exc:
+        u = _user()
+        c = u.client
+        if not u.tasks.active and c.password_held and c.user_id:
+            try:
+                if c.relogin():
+                    try:
+                        return fn()
+                    except AuthExpired:
+                        pass
+            except Exception:
+                pass
+        if not u.tasks.active:
+            c._set_batch_failure(exc)
+        raise
+
+
 def _mask_id(u: str) -> str:
     return (u[:3] + "***") if u and len(u) > 3 else ("***" if u else "")
 
@@ -365,7 +394,7 @@ def search():
         return err("请选择课程类型。", 422)
     student_class = str(_user().cfg.settings.get("student_class", ""))
     try:
-        all_rows = _load_all_rows(c, code)
+        all_rows = _read_with_session_heal(lambda: _load_all_rows(c, code))
     except ClientError as exc:
         return client_err(exc)
     matched = search_rows(all_rows, name)   # 留空 = 浏览该类型全部
@@ -381,7 +410,7 @@ def selected():
     if e:
         return e
     try:
-        rows = c.fetch_selected()
+        rows = _read_with_session_heal(lambda: c.fetch_selected())
     except ClientError as e:
         return client_err(e)
     out = []
@@ -447,7 +476,7 @@ def selected_detail():
     if e:
         return e
     try:
-        rows = c.fetch_selected()
+        rows = _read_with_session_heal(lambda: c.fetch_selected())
     except ClientError as e:
         return client_err(e)
     student_class = str(_user().cfg.settings.get("student_class", ""))

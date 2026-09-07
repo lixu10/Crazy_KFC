@@ -16,6 +16,7 @@ const S = {
   lastPillAuth: "",
   busy: false,
 };
+let _authRefreshing = false;   // 防止 api() 在 auth_expired 时无限递归刷新 bootstrap
 
 const MODE_NAMES = { grab: "抢课", poll: "仅监控", swap: "安全改选" };
 const STATUS_ZH = {
@@ -61,6 +62,14 @@ async function api(path, opts = {}) {
   er.code = info.code || "http_error";
   er.retryable = !!info.retryable;
   er.httpStatus = r.status;
+  // 会话被顶下线/过期时（auth_expired），顺带刷新 bootstrap，让批次条变红并
+  // 弹出“会话已过期/被顶下线 → 重新登录”的入口，而不是停留在绿色 ready。
+  if (er.code === "auth_expired" && path !== "/api/bootstrap" && path !== "/api/auth/login"
+      && !_authRefreshing) {
+    _authRefreshing = true;
+    refreshBootstrap().catch(() => resetAccountState())
+      .finally(() => { _authRefreshing = false; });
+  }
   throw er;
 }
 
@@ -85,6 +94,21 @@ function renderAll() {
   renderQueue();
   renderModePanel();
   renderTask();
+  updateReloginBar();
+}
+
+/* 重新登录条：任务“等待重新登录”时，或会话被顶下线/过期（空闲无任务）时显示。 */
+let _reloginBarShown = false;   // 只在重新登录条“变为可见”那一刻聚焦，避免每次轮询抢焦点
+function updateReloginBar() {
+  const bar = $("reloginBar");
+  if (!bar) return;
+  const t = S.task;
+  const waiting = !!(t && t.status === "waiting_login");
+  const expired = S.auth.logged_in && !!S.batch && S.batch.state === "auth_expired";
+  const show = waiting || (expired && !S.active);
+  bar.classList.toggle("hidden", !show);
+  if (show && !_reloginBarShown) $("inpReloginPwd").focus();
+  _reloginBarShown = show;
 }
 
 function renderAuth() {
@@ -117,7 +141,7 @@ function renderBatchPill() {
   const p = $("pillBatch");
   const b = activeBatch();
   const state = S.batch.state || (b ? "ready" : "unavailable");
-  if (b) {
+  if (b && state === "ready") {
     const label = b.name || b.display_name || `批次 …${String(b.id).slice(-8)}`;
     p.textContent = `批次 · ${label}`;
     p.dataset.state = state === "ready" ? "ok" : "warn";
@@ -133,7 +157,8 @@ function renderBatchPill() {
       unavailable: "暂时没有可用批次",
     };
     p.textContent = state === "selection_required" ? "批次 · 待选择"
-      : state === "not_open" ? "批次 · 尚未开放" : "批次 · 未就绪";
+      : state === "not_open" ? "批次 · 尚未开放"
+      : state === "auth_expired" ? "批次 · 会话已过期" : "批次 · 未就绪";
     p.dataset.state = state === "auth_expired" || state === "unavailable" ? "err" : "warn";
     $("batchState").textContent = S.batch.message || labels[state] || "尚未取得有效批次";
     $("batchState").className = "state-line" + (state === "unavailable" || state === "auth_expired" ? " error" : "");
@@ -232,7 +257,7 @@ async function doResume() {
     await api("/api/auth/relogin", { method: "POST", body: { password: pwd } });
     $("inpReloginPwd").value = "";
     await refreshBootstrap();
-    toast("已恢复任务", "ok");
+    toast(S.active ? "已恢复任务" : "已恢复会话", "ok");
   } catch (err) { toast(err.message, "error"); }
 }
 
@@ -502,7 +527,7 @@ function renderTask() {
     meta.textContent = "尚无任务";
     $("taskStatesWrap").classList.add("hidden");
     stop.hidden = true;
-    reloginBar.classList.add("hidden");
+    updateReloginBar();
     setStateLine("taskState", "未启动任务。先在左侧登录并获得批次，然后搜索加入目标。", "");
     $("pillTask").textContent = "任务 · 空闲";
     $("pillTask").dataset.state = "idle";
@@ -516,7 +541,7 @@ function renderTask() {
     : (t.status === "succeeded") ? "ok" : "idle";
   stop.hidden = !S.active;
   stop.textContent = t.stop_requested ? "正在安全停止…" : "停止任务";
-  reloginBar.classList.toggle("hidden", t.status !== "waiting_login");
+  updateReloginBar();
   const bits = [`#${t.id} · ${MODE_NAMES[t.mode] || t.mode} · ${STATUS_ZH[t.status] || t.status}`];
   if (t.started_ts) bits.push("开始 " + t.started_ts);
   if (t.stage) bits.push("当前：" + t.stage);
