@@ -24,12 +24,15 @@ SSO_LOGIN = "https://sso.buaa.edu.cn/login"
 XK_CAS = BASE_URL + "/xsxk/auth/cas"
 BYXT_SERVICE = "https://byxt.buaa.edu.cn/jwapp/sys/homeapp/index.do"
 STUDENT_INFO_URL = BASE_URL + "/xsxk/web/studentInfo"
-ELECTIVE_USER_URL = BASE_URL + "/xsxk/elective/user"
 LIST_URL = BASE_URL + "/xsxk/elective/buaa/clazz/list"
 ADD_URL = BASE_URL + "/xsxk/elective/buaa/clazz/add"
 DROP_URL = BASE_URL + "/xsxk/elective/clazz/del"
 SELECTED_URL = BASE_URL + "/xsxk/elective/select"
 
+# 当前轮次默认批次（官方“补退选含重修”轮次；参考脚本同样以该 ID 工作）。
+# 仅作为发现阶段的“默认候选”，仍需远端验证通过才会被采用；账号若处于其他轮次
+# （研选本/本选研等），该候选会被退回且不影响其真实开放批次被采纳。
+DEFAULT_BATCH_ID = "8e6a783d2d5241a2a9a976c2f90f8338"
 LEGACY_BATCH_IDS = ["cbfbe323d2ee4dec83542cd46dba9b65"]
 MAX_BATCH_CANDIDATES = 12
 
@@ -285,8 +288,13 @@ class ElectionClient:
         try:
             payload = resp.json()
         except (ValueError, json.JSONDecodeError):
-            # 只有无法解析为 JSON 的页面才按整页文案分类；成功 JSON 中的
-            # 课程名或某个不可选批次原因可能同样包含“未开放”等词。
+            # 数据接口被 302 退回选课 SPA 首页时，上游返回的是 profile 页面
+            # （HTML 而非 JSON）：按“请求未获准访问该数据接口”分类，而不是笼统
+            # 报“无法识别的页面”。只有无法解析为 JSON 的页面才做这种整页判断；
+            # 成功 JSON 中的课程名或某个不可选批次原因可能同样包含“未开放”等词。
+            bounced = self._profile_bounce_error(final, text)
+            if bounced is not None:
+                raise bounced
             if _contains_any(text, _NOT_OPEN_WORDS):
                 raise ClientError("统一认证已成功，但选课系统尚未开放课程服务。",
                                   code="election_not_open", http_status=409, retryable=True)
@@ -306,6 +314,29 @@ class ElectionClient:
         msg = str(payload.get("msg", "") or payload.get("message", ""))
         if _code(payload) == "401" or "token" in msg.lower() or _contains_any(msg, _AUTH_WORDS):
             raise AuthExpired("统一认证会话已过期，请重新登录。")
+
+    def _profile_bounce_error(self, final, text: str):
+        """数据接口被 302 退回选课 SPA 首页（/xsxk/profile/index.html）时分类。
+
+        requests 默认跟随 302，最终落在 profile 首页：此时响应是 HTML 而非 JSON。
+        认证态下该页会内嵌 var batch/currentBatch（账号权威当前批次）；若无内嵌批次，
+        说明会话已不被选课服务接受。返回 ClientError 表示命中该情形，否则返回 None
+        交普通非 JSON 分支处理（未开放/维护/无法识别）。
+        """
+        netloc = str(getattr(final, "netloc", "") or "").lower()
+        path = str(getattr(final, "path", "") or "")
+        if netloc != "byxk.buaa.edu.cn" or "/xsxk/profile/" not in path:
+            return None
+        seeds = self._inline_batch_choices(text)
+        if not seeds:
+            return AuthExpired("登录会话已失效，请重新登录后重试。")
+        current = next((s.get("id") for s in seeds), None)
+        if self.batch_id and current and current != self.batch_id:
+            return ClientError("当前选课批次已更换，请重新发现并选择当前批次后再试。",
+                               code="election_not_open", http_status=409, retryable=True)
+        return ClientError("当前选课轮次尚未对本账号开放课程列表（请求被退回选课首页）。"
+                           "请确认选课已开放，或稍后重新登录再试。",
+                           code="election_not_open", http_status=409, retryable=True)
 
     def _business_error(self, payload: dict, fallback: str) -> ClientError:
         msg = _safe_message(payload.get("msg") or payload.get("message"), fallback)
@@ -574,10 +605,17 @@ class ElectionClient:
                         out.append(item)
         return out
 
-    def _metadata_request(self) -> List[dict]:
+    def _metadata_request(self, seed: str = "") -> List[dict]:
+        """读取账号权威批次列表（含名称与 canSelect 标记）。
+
+        studentInfo 只有在 Batchid 头是“当前生效”的批次时才返回 JSON；空或失效
+        seed 会被 302 退回选课首页。调用方应按候选优先级逐个传入 seed 尝试，
+        取到权威列表即停止。
+        """
         choices: List[dict] = []
+        headers = self._xk_headers(seed) if seed else self._xk_headers_without_batch()
         try:
-            resp = self._post(STUDENT_INFO_URL, headers=self._xk_headers_without_batch(), json={})
+            resp = self._post(STUDENT_INFO_URL, headers=headers, json={})
             payload = self._response_json(resp, "批次信息")
             if _code(payload) == "200":
                 choices = self._student_choices(payload)
@@ -590,21 +628,22 @@ class ElectionClient:
             log().info("账号批次信息暂不可用（%s）", exc.code)
         return choices
 
-    def _user_metadata_request(self, seed: str) -> List[dict]:
-        if not seed:
-            return []
-        try:
-            resp = self._post(ELECTIVE_USER_URL, headers=self._xk_headers(seed),
-                              json={"batchId": seed})
-            payload = self._response_json(resp, "批次上下文")
-            if _code(payload) == "200":
-                return self._student_choices(payload)
-        except AuthExpired:
-            raise
-        except ClientError as exc:
-            self._discovery_errors.append(exc)
-            log().info("批次上下文暂不可用（%s）", exc.code)
-        return []
+    def _batch_seed_candidates(self) -> List[str]:
+        """按优先级收集读取权威批次的 seed；自动剔除空值与重复。"""
+        settings = self.cfg.settings
+        raw = [
+            str(self.batch_id or ""),
+            str(settings.get("batch_last_id") or ""),
+            str(settings.get("batch_manual_id") or ""),
+            DEFAULT_BATCH_ID,
+        ]
+        raw.extend(LEGACY_BATCH_IDS)
+        out: List[str] = []
+        for value in raw:
+            value = str(value or "").strip()
+            if _BATCH_FULL_RE.fullmatch(value) and value not in out:
+                out.append(value)
+        return out
 
     def candidates(self) -> List[str]:
         """兼容旧调用：返回当前可发现候选 ID。"""
@@ -613,28 +652,51 @@ class ElectionClient:
 
     def _collect_choices(self) -> List[dict]:
         self._discovery_errors = []
-        structured = self._metadata_request()
-        choices = self._merge_choices([], structured)
-        seed = ""
-        if choices:
-            seed = choices[0]["id"]
-        else:
-            seed = str(self.batch_id or self.cfg.settings.get("batch_last_id") or "")
-        if seed:
-            choices = self._merge_choices(choices, self._user_metadata_request(seed))
-        try:
-            landing = self._get(XK_CAS, session=self.xk_session,
-                                headers=self._xk_headers_without_batch(), allow_redirects=True)
-            choices = self._merge_choices(choices, self._inline_batch_choices(landing.text or ""))
-        except AuthExpired:
-            raise
-        except ClientError as exc:
-            self._discovery_errors.append(exc)
+        choices: List[dict] = []
+        tried = set()
+
+        # 1) 权威来源：studentInfo 需要非空 Batchid 头且只有“当前生效”批次 seed
+        #    才肯返回 JSON（含真实名称与 canSelect）。按优先级逐一种子尝试，取到
+        #    权威列表即停止；失效 seed 只是被退回，不代表账号已关闭。
+        for seed in self._batch_seed_candidates():
+            if seed in tried:
+                continue
+            tried.add(seed)
+            structured = self._metadata_request(seed)
+            if structured:
+                choices = self._merge_choices(choices, structured)
+                break
+
+        # 2) 没有权威列表时，退回首页内嵌批次作 seed 再试一次（例如账号的真实
+        #    开放轮次与默认/上次批次不同时，landing 的 var batch 就是它的轮次）。
+        if not choices:
+            inline: List[dict] = []
+            try:
+                landing = self._get(XK_CAS, session=self.xk_session,
+                                    headers=self._xk_headers_without_batch(),
+                                    allow_redirects=True)
+                inline = self._inline_batch_choices(landing.text or "")
+            except AuthExpired:
+                raise
+            except ClientError as exc:
+                self._discovery_errors.append(exc)
+            for item in inline:
+                seed = str(item.get("id", "") or "")
+                if seed and seed not in tried:
+                    tried.add(seed)
+                    structured = self._metadata_request(seed)
+                    if structured:
+                        choices = self._merge_choices(choices, structured)
+                        break
+            choices = self._merge_choices(choices, inline)
+
+        # 3) ID-only 回退来源：合并后由 discover_batch 逐个验证、通过才采用。
         choices = self._merge_choices(choices, self._captured_choices)
         choices = self._merge_choices(choices, self._url_choices())
         settings = self.cfg.settings
         for value, source in (
             (settings.get("batch_last_id"), "last_success"),
+            (DEFAULT_BATCH_ID, "default"),
             *((value, "legacy") for value in LEGACY_BATCH_IDS),
             (settings.get("batch_manual_id"), "manual"),
         ):

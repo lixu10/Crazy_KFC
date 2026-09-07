@@ -27,7 +27,7 @@ const SOURCE_ZH = {
   account_elective: "账号普通批次", account_experimental: "账号实验批次",
   student_info: "账号批次", elective_user: "账号上下文", landing: "页面解析",
   login_location: "登录捕获", html: "页面解析", last_success: "上次成功",
-  legacy: "兼容候选", manual: "手动指定", unknown: "未设置",
+  legacy: "兼容候选", manual: "手动指定", default: "当前默认", unknown: "未设置",
 };
 const TERMINAL_STATUS = new Set(["succeeded", "stopped", "failed", "manual_attention"]);
 const SUBJECT_ZH = {

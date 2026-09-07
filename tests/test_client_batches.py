@@ -1,7 +1,8 @@
 import tempfile
 import unittest
 
-from kfc_college.client import ClientError, ElectionClient
+from kfc_college.client import (ClientError, DEFAULT_BATCH_ID,
+                                ElectionClient)
 from kfc_college.config import ConfigStore
 
 
@@ -42,6 +43,27 @@ class StubClient(ElectionClient):
         if self.fixed_choices is not None:
             return [dict(item) for item in self.fixed_choices]
         return super()._collect_choices()
+
+
+class LandingStub(StubClient):
+    """可自定义 landing 页 HTML 的桩：用于测“默认批次失效后回退 landing seed”。"""
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        self.landing_html = "<html></html>"
+
+    def _get(self, url, **kwargs):
+        return FakeResponse({}, text=self.landing_html, url=url)
+
+
+def not_open_html():
+    return FakeResponse(ValueError(), text="<html>选课系统尚未开放</html>")
+
+
+def student_info_payload(batch_id, name, can_select="1"):
+    return {"code": "200", "data": {"student": {
+        "electiveBatchList": [{"code": batch_id, "name": name, "canSelect": can_select}],
+    }}}
 
 
 def choice(batch_id, name, **extra):
@@ -172,6 +194,47 @@ class BatchClientTests(unittest.TestCase):
         runtime = self.client.discover_batch()
         self.assertEqual(runtime["choices"][0]["status"], "confirmation_required")
         self.assertEqual(self.client.responses, [])
+
+    def test_default_batch_recovers_authoritative_list(self):
+        # 未存任何批次时，发现流程应尝试默认批次去读 studentInfo 权威列表，
+        # 从而拿到真实名称与 can_select=1，而不是被空 Batchid 退回首页。
+        self.client.responses = [
+            FakeResponse(student_info_payload(DEFAULT_BATCH_ID, "补退选含重修")),
+        ]
+        choices = self.client._collect_choices()
+        self.assertEqual(choices[0]["id"], DEFAULT_BATCH_ID)
+        self.assertEqual(choices[0]["name"], "补退选含重修")
+        self.assertIs(choices[0]["can_select"], True)
+        self.assertEqual(self.client.responses, [])  # 一次权威请求命中即停止
+
+    def test_default_batch_open_round_is_discovered_and_adopted(self):
+        # 端到端：默认批次开放时，discover 应验证并采用它（写 batch_last）。
+        self.client.responses = [
+            FakeResponse(student_info_payload(DEFAULT_BATCH_ID, "补退选含重修")),
+            FakeResponse({"code": 200, "data": {"rows": []}}),   # validate DEFAULT
+            not_open_html(),                                     # validate legacy 关闭
+        ]
+        runtime = self.client.discover_batch()
+        self.assertEqual(runtime["state"], "ready")
+        self.assertEqual(runtime["active"]["id"], DEFAULT_BATCH_ID)
+        self.assertEqual(runtime["active"]["name"], "补退选含重修")
+        self.assertEqual(self.client.cfg.settings.get("batch_last_id"), DEFAULT_BATCH_ID)
+
+    def test_landing_seed_is_probed_when_default_batch_not_open(self):
+        # 账号真实开放轮次是研选本、默认补退选对其关闭时，应回退 landing 的
+        # var batch 作 seed 读权威列表，而不是把账号误判为“尚未开放”。
+        client = LandingStub(self.cfg)
+        client.landing_html = '<script>var batch = {"code":"batchInline01",' \
+                              '"name":"2026年秋季学期研选本"}</script>'
+        client.responses = [
+            not_open_html(),  # studentInfo(默认批次) -> 退回
+            not_open_html(),  # studentInfo(legacy)  -> 退回
+            FakeResponse(student_info_payload("batchInline01", "研选本")),  # landing seed
+        ]
+        choices = client._collect_choices()
+        self.assertEqual(choices[0]["id"], "batchInline01")
+        self.assertEqual(choices[0]["name"], "研选本")
+        self.assertIs(choices[0]["can_select"], True)
 
 
 if __name__ == "__main__":
