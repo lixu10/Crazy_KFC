@@ -321,13 +321,37 @@ def _require_batch():
     return c, None
 
 
+# 搜索/浏览：一次性分页拉全某课程类型的可选教学班，再做本地模糊过滤。
+# 每页上限 999（上游分页），最多翻 6 页；结果过多时只返回前 _MAX_SEARCH_RESULTS 条并标记 truncated。
+_SEARCH_MAX_RESULTS = 2000
+
+
+def _load_all_rows(c, code: str, page_size: int = 0,
+                   max_pages: int = 0) -> list:
+    """把某课程类型全部可选教学班分页拉取并去重（JXBID）。"""
+    page_size = page_size or _PAGE_SIZE
+    max_pages = max_pages or _MAX_PAGES
+    rows: list = []
+    seen: set = set()
+    for page in range(1, max_pages + 1):
+        page_rows = c.list_classes(code, page_size=page_size, page=page)
+        for r in page_rows:
+            j = str(r.get("JXBID") or "")
+            if j:
+                if j in seen:
+                    continue
+                seen.add(j)
+            rows.append(r)
+        if len(page_rows) < page_size:
+            break
+    return rows
+
+
 @bp.post("/api/courses/search")
 def search():
     body = request.get_json(silent=True) or {}
     name = str(body.get("name", "")).strip()
     type_id = body.get("class_type_id")
-    if name is None or not name:
-        return err("请输入要搜索的课程完整名称或课程代码。", 422)
     c, e = _require_batch()
     if e:
         return e
@@ -341,12 +365,14 @@ def search():
         return err("请选择课程类型。", 422)
     student_class = str(_user().cfg.settings.get("student_class", ""))
     try:
-        rows = c.list_classes(code)
-    except ClientError as e:
-        return client_err(e)
-    matched = search_rows(rows, name)
-    out = [normalize_section(r, code, student_class) for r in matched]
-    return ok({"count": len(out), "sections": out[:200]})
+        all_rows = _load_all_rows(c, code)
+    except ClientError as exc:
+        return client_err(exc)
+    matched = search_rows(all_rows, name)   # 留空 = 浏览该类型全部
+    total = len(matched)
+    shown = matched[:_SEARCH_MAX_RESULTS]
+    out = [normalize_section(r, code, student_class) for r in shown]
+    return ok({"count": total, "truncated": total > len(shown), "sections": out})
 
 
 @bp.get("/api/courses/selected")

@@ -298,26 +298,32 @@ async function doSearch(e) {
   e.preventDefault();
   const name = $("inpSearchName").value.trim();
   const typeId = parseInt($("selType").value, 10);
-  if (!name) { toast("请输入课程名称或代码", "error"); return; }
   if (Number.isNaN(typeId)) { toast("请选择课程类型", "error"); return; }
-  setStateLine("searchState", "搜索中…");
+  setStateLine("searchState", name ? "搜索中…" : "正在加载该类型全部课程…");
   try {
     const data = await api("/api/courses/search", { method: "POST", body: { name, class_type_id: typeId } });
     $("resultWrap").classList.remove("hidden");
-    renderResults(data.sections || []);
-    setStateLine("searchState", data.count === 0 ? "未找到精确匹配的教学班。" : "找到 " + data.count + " 个教学班。", data.count ? "ok" : "");
-    if (!data.sections || !data.sections.length) $("resultWrap").classList.add("hidden");
+    renderResults(data.sections || [], data.count || 0);
+    const shown = (data.sections || []).length;
+    let msg;
+    if (!data.count) msg = "未找到匹配的课程（可留空列出该类型全部）。";
+    else if (data.truncated) msg = `匹配 ${data.count} 个教学班，仅显示前 ${shown} 个。`;
+    else msg = `共 ${data.count} 个教学班，可多选加入目标。`;
+    setStateLine("searchState", msg, data.count ? "ok" : "");
+    if (!shown) $("resultWrap").classList.add("hidden");
   } catch (err) {
     $("resultWrap").classList.add("hidden");
     setStateLine("searchState", err.message, "error");
   }
 }
 
-function renderResults(sections) {
+function renderResults(sections, total) {
   const tb = $("resultTable").querySelector("tbody");
   tb.innerHTML = "";
   if (!sections || !sections.length) { $("resultCount").textContent = "无结果"; return; }
-  $("resultCount").textContent = `本次结果 ${sections.length} 个，可多选加入目标。`;
+  $("resultCount").textContent = total == null || total === sections.length
+    ? `共 ${sections.length} 个教学班，可多选加入目标。`
+    : `匹配 ${total} 个，当前显示 ${sections.length} 个，可多选加入目标。`;
   sections.forEach((s) => {
     const tr = document.createElement("tr");
     const mark = s.has_slot ? `<span class="good">${s.selected}/${s.capacity} 有空</span>`
