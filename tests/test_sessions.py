@@ -130,6 +130,48 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(self.manager.count(), 0)
         self.assertEqual(self.manager.sid_count(), 0)
 
+    def test_idle_session_is_reaped_by_reaper_thread(self):
+        # 回归：reaper 线程此前因 _reap_interval/_reaper_interval 拼写不一致在启动即
+        # 崩溃，导致空闲账号永不回收（陈旧批次/会话残留）。这里用极小阈值触发真实回收。
+        mgr = UserManager(
+            self.tmp.name + "/reaper",
+            client_factory=FakeClient,
+            notifier_factory=FakeNotifier,
+            task_factory=FakeTasks,
+            idle_ttl=0.15, reaper_interval=0.05,
+        )
+        try:
+            session, _sid, _ = mgr.login_or_attach("100002", "secret")
+            deadline = time.time() + 3
+            while time.time() < deadline and mgr.get_by_uid("100002") is not None:
+                time.sleep(0.05)
+            self.assertIsNone(mgr.get_by_uid("100002"))
+            self.assertTrue(session.closed)
+            self.assertTrue(session.client.logged_out)
+        finally:
+            mgr.shutdown()
+
+    def test_logout_account_closes_all_sids(self):
+        session, sid1, _ = self.manager.login_or_attach("100003", "secret")
+        _, sid2, _ = self.manager.login_or_attach("100003", "secret")
+        closed = self.manager.logout_account(session)
+        self.assertEqual(closed, 2)
+        self.assertEqual(self.manager.count(), 0)
+        self.assertEqual(self.manager.sid_count(), 0)
+        self.assertTrue(session.closed)
+        self.assertTrue(session.client.logged_out)
+        self.assertIsNone(self.manager.get_by_sid(sid1))
+        self.assertIsNone(self.manager.get_by_sid(sid2))
+
+    def test_logout_account_rejected_while_task_active(self):
+        session, sid, _ = self.manager.login_or_attach("100004", "secret")
+        session.tasks.active = True
+        with self.assertRaises(LoginConflict):
+            self.manager.logout_account(session)
+        self.assertIs(self.manager.get_by_sid(sid), session)
+        self.assertIn(sid, session.local_sids)
+        session.tasks.active = False
+
 
 if __name__ == "__main__":
     unittest.main()

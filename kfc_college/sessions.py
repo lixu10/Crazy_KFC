@@ -268,6 +268,24 @@ class UserManager:
             log().info("浏览器已退出账号会话（%s）", self._mask_uid(sess.uid))
         return close_account
 
+    def logout_account(self, sess: UserSession) -> int:
+        """一键注销账号在选课网站的全部登录：下线该账号绑定的所有浏览器 sid。
+
+        与 detach（只退出当前浏览器）不同，即便仍有其他浏览器在线也一并下线；
+        账号仍有运行任务时拒绝（抛 LoginConflict）。下线后需重新登录才能再用。
+        """
+        if sess is None:
+            return 0
+        with self._lock:
+            if sess.tasks.active:
+                raise LoginConflict("任务运行中，请先停止任务再退出选课站登录。")
+            closed_sids = len(sess.local_sids)
+            self._remove_locked(sess)
+        sess.close()
+        log().info("账号已退出选课站登录（%s），下线 %d 个浏览器",
+                   self._mask_uid(sess.uid), closed_sids)
+        return closed_sids
+
     def logout(self, sess: UserSession) -> None:
         """强制关闭一个账号级会话，供管理/兼容代码使用。"""
         if sess is None:
@@ -299,7 +317,7 @@ class UserManager:
     # ---------- 空闲回收 ----------
     def _reap_loop(self) -> None:
         while True:
-            time.sleep(self._reap_interval)
+            time.sleep(self._reaper_interval)
             try:
                 self._reap_once()
             except Exception:  # noqa: BLE001

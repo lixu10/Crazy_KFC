@@ -36,6 +36,16 @@ DEFAULT_BATCH_ID = "8e6a783d2d5241a2a9a976c2f90f8338"
 LEGACY_BATCH_IDS = ["cbfbe323d2ee4dec83542cd46dba9b65"]
 MAX_BATCH_CANDIDATES = 12
 
+# 自动重登（无显式密码）遇到错误密码时的指数退避与封顶：连续错误达到上限即
+# 清空内存密码、停止一切自动重试，改由用户在页面手动输入新密码。
+AUTO_RELOGIN_BASE_BACKOFF = 5.0
+AUTO_RELOGIN_MAX_BACKOFF = 300.0
+AUTO_RELOGIN_MAX_FAILS = 6
+
+# 非就绪批次（未开放/不可用）的自动重检最小间隔：上游短暂异常被误判后可自愈，
+# 同时避免浏览器轮询把上游请求放大。
+BATCH_AUTO_RECHECK_SEC = 45.0
+
 UA_CHROME = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
              "(KHTML, like Gecko) Chrome/127.0.6533.100 Safari/537.36")
 
@@ -186,12 +196,18 @@ class ElectionClient:
         self.batch_validated_ts = ""
         self.batch_state = "unavailable"
         self.batch_message = "尚未发现有效批次。"
+        self.batch_state_ts = 0.0
         self.batch_choices: List[dict] = []
 
         self._captured: List[str] = []
         self._captured_choices: List[dict] = []
         self._discovery_errors: List[ClientError] = []
         self.last_login_error = ""
+        # invalid_credentials 自动重登退避（见 AUTO_RELOGIN_*）
+        self._auto_relogin_fails = 0
+        self._auto_relogin_deadline = 0.0
+        # 非就绪批次的自动重检去抖（见 BATCH_AUTO_RECHECK_SEC）
+        self._auto_recheck_at = 0.0
 
     # ---------- 基础属性 ----------
     @property
@@ -376,6 +392,9 @@ class ElectionClient:
                 self._password = ""
                 self.login_ready.clear()
                 raise
+            # 全新登录成功：凭据有效，清空任何旧的自动重登退避。
+            self._auto_relogin_fails = 0
+            self._auto_relogin_deadline = 0.0
             try:
                 self.resolve_batch()
             except ClientError as exc:
@@ -859,6 +878,7 @@ class ElectionClient:
         log().info("批次已生效（来源=%s）", self.batch_source)
 
     def _set_batch_failure(self, exc: ClientError) -> None:
+        self.batch_state_ts = time.time()
         if exc.code == "election_not_open":
             self.batch_state = "not_open"
         elif exc.code == "auth_expired":
@@ -866,6 +886,27 @@ class ElectionClient:
         else:
             self.batch_state = "unavailable"
         self.batch_message = exc.message
+
+    def maybe_auto_recheck(self) -> bool:
+        """非就绪状态（未开放/不可用）的自动重检，供读/引导路径去抖自愈。
+
+        上游短暂异常（限流、被退回首页等）可能被误判成“未开放/不可用”，而账号
+        的认证会话仍然有效、不会自行恢复。此方法按 BATCH_AUTO_RECHECK_SEC 冷却，
+        重新执行 resolve_batch（尊重手动批次模式）；成功后状态回到 ready。
+        返回是否真的发起了一次重检。
+        """
+        with self._lock:
+            if not self.authenticated or self.batch_state not in ("not_open", "unavailable"):
+                return False
+            now = time.time()
+            if now - self._auto_recheck_at < BATCH_AUTO_RECHECK_SEC:
+                return False
+            self._auto_recheck_at = now
+        try:
+            self.resolve_batch()
+        except ClientError:
+            return False
+        return True
 
     def batch_runtime(self) -> dict:
         with self._lock:
@@ -887,6 +928,7 @@ class ElectionClient:
         self.batch_name = ""
         self.batch_source = "unknown"
         self.batch_validated_ts = ""
+        self.batch_state_ts = time.time()
         if not keep_choices:
             self.batch_choices = []
             self.batch_state = "unavailable"
@@ -907,10 +949,18 @@ class ElectionClient:
         log().info("已退出登录")
 
     def relogin(self, password: Optional[str] = None) -> bool:
+        auto = password is None
         with self._lock:
             if not self.user_id:
                 return False
-            candidate_password = self._password if password is None else str(password or "")
+            if auto:
+                # 自动重登（无显式密码，任务/空闲自愈触发）遇错误密码要退避封顶，
+                # 冷却期内直接拒绝，不再以每秒一次的频率死磕统一认证。
+                if time.time() < self._auto_relogin_deadline:
+                    self.last_login_error = ("自动重登受限：密码疑似已变更，"
+                                             "请在页面重新输入密码。")
+                    return False
+            candidate_password = self._password if auto else str(password or "")
             if not candidate_password:
                 return False
 
@@ -943,7 +993,23 @@ class ElectionClient:
                     self.login_ready.clear()
                 self.last_login_error = exc.message
                 log().warning("自动重登失败（%s）", exc.code)
+                if auto and exc.code == "invalid_credentials":
+                    # 凭据确实被拒：指数退避，连续错误达上限则清空内存密码停手。
+                    self._auto_relogin_fails += 1
+                    delay = min(AUTO_RELOGIN_BASE_BACKOFF
+                                * (2 ** (self._auto_relogin_fails - 1)),
+                                AUTO_RELOGIN_MAX_BACKOFF)
+                    self._auto_relogin_deadline = time.time() + delay
+                    if self._auto_relogin_fails >= AUTO_RELOGIN_MAX_FAILS:
+                        self._password = ""
+                        self.last_login_error = ("多次自动重登失败（密码可能已变更），"
+                                                 "已停止自动重试，请在页面重新登录。")
+                        log().warning("连续 %d 次密码错误，停止自动重登，等待用户手动重登",
+                                      self._auto_relogin_fails)
                 return False
+            # 认证本身成功：凭据有效，清除错误密码退避，后续仍可自动重登。
+            self._auto_relogin_fails = 0
+            self._auto_relogin_deadline = 0.0
             try:
                 if previous_id:
                     result = self.discover_batch(previous_id, require_preferred=True)

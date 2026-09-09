@@ -113,8 +113,10 @@ function updateReloginBar() {
 
 function renderAuth() {
   const btn = $("btnLogout");
+  const btnAll = $("btnLogoutAll");
   if (S.auth.logged_in) {
     btn.hidden = false;
+    if (btnAll) btnAll.hidden = false;
     $("btnSelected").hidden = false;
     $("pillAuth").textContent = "认证 · " + (S.auth.user || "已登录");
     $("pillAuth").dataset.state = "ok";
@@ -122,6 +124,7 @@ function renderAuth() {
     $("btnLogin").disabled = true;
   } else {
     btn.hidden = true;
+    if (btnAll) btnAll.hidden = true;
     $("btnSelected").hidden = true;
     $("pillAuth").textContent = "认证 · 未登录";
     $("pillAuth").dataset.state = "idle";
@@ -247,6 +250,18 @@ async function doLogout() {
     await api("/api/auth/logout", { method: "POST", body: {} });
     await refreshBootstrap();
     toast("已退出登录", "ok");
+  } catch (err) { toast(err.message, "error"); }
+}
+
+async function doLogoutAll() {
+  const note = "确认让该账号在本工具对选课网站的全部登录下线？\n\n"
+    + "共享该账号的所有浏览器都会一起退出（如任务在运行请先停止），"
+    + "之后需重新输入统一认证密码才能继续。";
+  if (!window.confirm(note)) return;
+  try {
+    const d = await api("/api/auth/logout-all", { method: "POST", body: {} });
+    await refreshBootstrap();
+    toast((d && d.message) || "已退出选课站全部登录", "ok");
   } catch (err) { toast(err.message, "error"); }
 }
 
@@ -620,9 +635,22 @@ async function pollOnce() {
       }
       S.lastSeq = ev.last_seq;
     } catch (e) { /* 忽略事件轮询瞬时错误 */ }
+    maybeProbeStaleBatch();
   } finally {
     _pollInFlight = false;
   }
+}
+
+/* 批次停在“未开放/不可用”且无任务时，周期性重拉 bootstrap：后端会按冷却自动
+   重检批次，上游一旦恢复（或此前是误判），状态条自行恢复，无需手动刷新/重登。 */
+let _stalePollCount = 0;
+function maybeProbeStaleBatch() {
+  if (!S.auth || !S.auth.logged_in || S.active) { _stalePollCount = 0; return; }
+  const st = S.batch && S.batch.state;
+  if (st !== "not_open" && st !== "unavailable") { _stalePollCount = 0; return; }
+  if (++_stalePollCount < 45) return;
+  _stalePollCount = 0;
+  refreshBootstrap().catch(() => {});
 }
 
 /* ---------- bootstrap ---------- */
@@ -934,6 +962,7 @@ async function submitGate(e) {
 function bind() {
   $("formLogin").addEventListener("submit", doLogin);
   $("btnLogout").addEventListener("click", doLogout);
+  $("btnLogoutAll").addEventListener("click", doLogoutAll);
   $("btnResume").addEventListener("click", doResume);
   $("inpReloginPwd").addEventListener("keydown", (e) => { if (e.key === "Enter") doResume(); });
 

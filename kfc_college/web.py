@@ -11,7 +11,7 @@ import secrets
 from flask import Blueprint, current_app, g, jsonify, render_template, request
 
 from .client import AuthExpired, ClientError, LoginError, NetworkError
-from .config import remember_proxy_secret, remember_secret
+from .config import log, remember_proxy_secret, remember_secret
 from .courses import (normalize_section, old_from_selected_row, search_rows,
                       selected_public, selected_public_full)
 from .models import (CODE_TO_TYPE, CourseTarget, ID_TO_TYPE, SwapPair,
@@ -149,7 +149,17 @@ def _bootstrap_payload(u) -> dict:
 
 @bp.get("/api/bootstrap")
 def bootstrap():
-    return ok(_bootstrap_payload(_user()))
+    u = _user()
+    # 自愈：认证仍有效但批次停在“未开放/不可用”且无任务时，按冷却自动重检，
+    # 避免上游短暂异常（限流/误判）后账号一直卡在未就绪状态、只能靠重登恢复。
+    if u is not None and not u.tasks.active:
+        recheck = getattr(u.client, "maybe_auto_recheck", None)
+        if callable(recheck):
+            try:
+                recheck()
+            except Exception:  # noqa: BLE001 自愈失败不应阻塞页面
+                log().warning("批次自动重检异常", exc_info=True)
+    return ok(_bootstrap_payload(u))
 
 
 # ---- 访问口令 ----
@@ -277,6 +287,27 @@ def logout():
     g._clear_sid = True
     message = "已退出当前浏览器。" if not closed else "已退出登录。"
     return ok({"message": message, "account_closed": closed})
+
+
+@bp.post("/api/auth/logout-all")
+def logout_all():
+    """一键退出该账号在选课网站的全部登录（本工具持有的共享上游会话）。
+
+    与 /api/auth/logout 只退当前浏览器不同：这里把该账号绑定的所有浏览器 sid
+    一并下线（其他浏览器下次轮询即回登录页）。任务运行中拒绝（409）。
+    """
+    u = _user()
+    if u is None:
+        return err("尚未登录。", 401)
+    try:
+        closed = _manager().logout_account(u)
+    except LoginConflict as e:
+        return err(e.message, 409, code="task_active")
+    g.sess = None
+    g.sid = None
+    g._clear_sid = True
+    return ok({"message": f"已退出该账号在选课网站的全部登录（下线 {closed} 个浏览器）。",
+               "browsers_closed": closed})
 
 
 # ---- 批次 ----

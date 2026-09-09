@@ -210,6 +210,31 @@ class WebTests(unittest.TestCase):
             self.assertEqual(response.status_code, 409, path)
             self.assertEqual(response.get_json()["error"]["code"], "task_active")
 
+    def test_logout_all_logs_out_every_browser_of_account(self):
+        first = self.app.test_client()
+        second = self.app.test_client()
+        self.assertEqual(self.login(first).status_code, 200)
+        self.assertEqual(self.login(second).status_code, 200)
+        manager = self.app.config["USER_MANAGER"]
+        self.assertEqual(manager.sid_count(), 2)
+        response = first.post("/api/auth/logout-all", json={})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["data"]["browsers_closed"], 2)
+        self.assertEqual(manager.count(), 0)
+        self.assertEqual(manager.sid_count(), 0)
+        boot = second.get("/api/bootstrap").get_json()["data"]
+        self.assertFalse(boot["auth"]["logged_in"])
+
+    def test_logout_all_rejected_while_task_active(self):
+        client = self.app.test_client()
+        self.login(client)
+        session = self.app.config["USER_MANAGER"].get_by_uid("100001")
+        session.tasks.active = True
+        response = client.post("/api/auth/logout-all", json={})
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["error"]["code"], "task_active")
+        self.assertTrue(client.get("/api/bootstrap").get_json()["data"]["auth"]["logged_in"])
+
 
 if __name__ == "__main__":
     unittest.main()
